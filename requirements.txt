@@ -1,0 +1,10 @@
+uv
+streamlit
+google-genai
+groq
+chromadb
+plotly
+pandas
+openpyxl
+python-dotenv
+tenacity
