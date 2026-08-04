@@ -51,12 +51,14 @@ def generate_response(
     question: str,
     result: ExecutionResult,
     budget: CallBudget,
-) -> tuple[str, go.Figure | None]:
+) -> tuple[str, go.Figure | None, bool]:
     """
-    Returns (nl_answer, plotly_figure_or_None).
+    Returns (nl_answer, plotly_figure_or_None, is_real_answer).
     figure is None when chart_type is table_only or chart build fails.
+    is_real_answer is False when the LLM call failed and a generic
+    placeholder was returned instead — callers should NOT cache that.
     """
-    nl_answer = _generate_answer(question, result, budget)
+    nl_answer, is_real_answer = _generate_answer(question, result, budget)
     fig = None
 
     if result.df is not None and not result.df.empty:
@@ -64,7 +66,7 @@ def generate_response(
         if decision["chart_type"] != "table_only":
             fig = _build_chart(result.df, decision, question)
 
-    return nl_answer, fig
+    return nl_answer, fig, is_real_answer
 
 
 # ── NL answer ─────────────────────────────────────────────────────────────────
@@ -73,7 +75,7 @@ def _generate_answer(
     question: str,
     result: ExecutionResult,
     budget: CallBudget,
-) -> str:
+) -> tuple[str, bool]:
     if result.df is None or result.df.empty:
         preview = "Empty result set — no matching rows were found."
     else:
@@ -85,7 +87,7 @@ def _generate_answer(
         f"Result preview:\n{preview}"
     )
     try:
-        return call_llm(
+        text = call_llm(
             messages=[
                 {"role": "system", "content": _ANSWER_SYSTEM},
                 {"role": "user", "content": user_content},
@@ -95,9 +97,10 @@ def _generate_answer(
             max_tokens=512,
             temperature=0.3,
         )
+        return text, True
     except Exception as exc:
-        logger.warning("Answer generation failed: %s", exc)
-        return f"Retrieved {result.row_count} row(s). See the table below for details."
+        logger.warning("Answer generation failed: %s — using fallback (not cached).", exc)
+        return f"Retrieved {result.row_count} row(s). See the table below for details.", False
 
 
 # ── chart type selection ──────────────────────────────────────────────────────

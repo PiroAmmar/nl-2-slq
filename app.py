@@ -147,7 +147,9 @@ def _generate_and_store_golden(db_path: str, schema: dict, dataset_hash: str) ->
 
 def _run_pipeline(question: str) -> None:
     """Full pipeline execution for one user question."""
-    budget = CallBudget(max_calls=8)
+    # 8 was too tight: 2-pass selection (2) + triage (1) + initial gen (1)
+    # + up to 2 regen cycles (4) already = 8, leaving nothing for Step 5.
+    budget = CallBudget(max_calls=12)
     db_path: str = st.session_state.db_path
     schema: dict = st.session_state.schema
     dataset_hash: str = st.session_state.dataset_hash
@@ -159,7 +161,7 @@ def _run_pipeline(question: str) -> None:
         if hit:
             with st.chat_message("assistant"):
                 st.success(f"⚡ Cache hit (similarity {hit['similarity']:.2f})")
-                st.write(hit["answer"])
+                st.markdown(hit["answer"])
                 st.code(hit["sql"], language="sql")
             st.session_state.messages.append(
                 {"role": "assistant", "content": hit["answer"]}
@@ -219,7 +221,7 @@ def _run_pipeline(question: str) -> None:
 
     # ── Step 5: Response + chart ──────────────────────────────────────────────
     try:
-        nl_answer, fig = generate_response(question, result, budget)
+        nl_answer, fig, is_real_answer = generate_response(question, result, budget)
     except RuntimeError as exc:
         _show_error(str(exc))
         return
@@ -235,10 +237,10 @@ def _run_pipeline(question: str) -> None:
                 st.metric(label=col_name, value=val)
             else:
                 if fig is not None:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                 # Always show full table below chart
                 with st.expander("📋 Full data table", expanded=fig is None):
-                    st.dataframe(result.df, use_container_width=True)
+                    st.dataframe(result.df, width="stretch")
         else:
             st.info("No data returned.")
 
@@ -259,8 +261,10 @@ def _run_pipeline(question: str) -> None:
 
     st.session_state.messages.append({"role": "assistant", "content": nl_answer})
 
-    # Cache new question+result for future lookups
-    if question_embedding is not None and result.success:
+    # Cache new question+result for future lookups — but never cache a
+    # fallback placeholder answer, or it poisons the semantic cache for
+    # every future similarly-worded question.
+    if question_embedding is not None and result.success and is_real_answer:
         golden_cache.store_golden(
             dataset_hash,
             [question],
@@ -268,6 +272,8 @@ def _run_pipeline(question: str) -> None:
             [nl_answer],
             [question_embedding[0]],
         )
+    elif not is_real_answer:
+        logger.warning("Not caching fallback answer for question: %s", question[:80])
 
 
 def _answer_general(question: str, budget: CallBudget) -> None:
@@ -307,54 +313,69 @@ with st.sidebar:
     )
 
     if uploaded:
-        try:
-            file_bytes = uploaded.getvalue()
-            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-            conn = sqlite3.connect(tmp.name)
-            total_rows = 0
+        # Hash first (cheap) — Streamlit reruns this block on every interaction
+        # (chat message, widget change, etc.) as long as a file sits in the
+        # uploader. Only do the expensive work (DB rebuild + golden-query
+        # generation) when this is genuinely a *new* file.
+        file_bytes = uploaded.getvalue()
+        dataset_hash = golden_cache.file_hash(file_bytes)
+        already_loaded = (
+            dataset_hash == st.session_state.get("dataset_hash")
+            and st.session_state.get("golden_ready")
+        )
 
-            if uploaded.name.endswith(".csv"):
-                df_upload = pd.read_csv(uploaded)
-                table_name = os.path.splitext(uploaded.name)[0].replace(" ", "_").lower()
-                df_upload.to_sql(table_name, conn, if_exists="replace", index=False)
-                total_rows = len(df_upload)
-                preview_df = df_upload.head(5)
-            else:
-                # Excel: read ALL sheets — returns dict[sheet_name → DataFrame]
-                sheets: dict = pd.read_excel(uploaded, sheet_name=None)
-                preview_df = None
-                for sheet_name, df_sheet in sheets.items():
-                    tbl = sheet_name.strip().replace(" ", "_").lower()
-                    # Normalise datetime cols → ISO string so SQLite strftime() works
-                    for col in df_sheet.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
-                        df_sheet[col] = df_sheet[col].dt.strftime("%Y-%m-%d %H:%M:%S")
-                    df_sheet.to_sql(tbl, conn, if_exists="replace", index=False)
-                    total_rows += len(df_sheet)
-                    if preview_df is None:
-                        preview_df = df_sheet.head(5)
-
-            conn.close()
-
-            dataset_hash = golden_cache.file_hash(file_bytes)
-            st.session_state.db_path = tmp.name
-            st.session_state.schema = _get_schema(tmp.name)
-            st.session_state.dataset_hash = dataset_hash
-            st.session_state.golden_ready = False
-            st.session_state.messages = []
-
+        if already_loaded:
+            # Same file already processed this session — just re-show the
+            # last-known status, do nothing else.
             n_tables = len(st.session_state.schema)
-            st.success(
-                f"Loaded **{uploaded.name}** — "
-                f"{n_tables} table(s), {total_rows:,} total rows"
-            )
-            if preview_df is not None:
-                st.dataframe(preview_df, use_container_width=True)
+            st.success(f"Loaded **{uploaded.name}** — {n_tables} table(s)")
+        else:
+            try:
+                tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+                conn = sqlite3.connect(tmp.name)
+                total_rows = 0
 
-            # Generate golden queries for this dataset
-            _generate_and_store_golden(tmp.name, st.session_state.schema, dataset_hash)
+                if uploaded.name.endswith(".csv"):
+                    df_upload = pd.read_csv(uploaded)
+                    table_name = os.path.splitext(uploaded.name)[0].replace(" ", "_").lower()
+                    df_upload.to_sql(table_name, conn, if_exists="replace", index=False)
+                    total_rows = len(df_upload)
+                    preview_df = df_upload.head(5)
+                else:
+                    # Excel: read ALL sheets — returns dict[sheet_name → DataFrame]
+                    sheets: dict = pd.read_excel(uploaded, sheet_name=None)
+                    preview_df = None
+                    for sheet_name, df_sheet in sheets.items():
+                        tbl = sheet_name.strip().replace(" ", "_").lower()
+                        # Normalise datetime cols → ISO string so SQLite strftime() works
+                        for col in df_sheet.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
+                            df_sheet[col] = df_sheet[col].dt.strftime("%Y-%m-%d %H:%M:%S")
+                        df_sheet.to_sql(tbl, conn, if_exists="replace", index=False)
+                        total_rows += len(df_sheet)
+                        if preview_df is None:
+                            preview_df = df_sheet.head(5)
 
-        except Exception as exc:
-            st.error(f"Upload failed: {exc}")
+                conn.close()
+
+                st.session_state.db_path = tmp.name
+                st.session_state.schema = _get_schema(tmp.name)
+                st.session_state.dataset_hash = dataset_hash
+                st.session_state.golden_ready = False
+                st.session_state.messages = []
+
+                n_tables = len(st.session_state.schema)
+                st.success(
+                    f"Loaded **{uploaded.name}** — "
+                    f"{n_tables} table(s), {total_rows:,} total rows"
+                )
+                if preview_df is not None:
+                    st.dataframe(preview_df, width="stretch")
+
+                # Generate golden queries — only reached for a genuinely new file
+                _generate_and_store_golden(tmp.name, st.session_state.schema, dataset_hash)
+
+            except Exception as exc:
+                st.error(f"Upload failed: {exc}")
 
     st.divider()
     st.subheader("Active schema")
