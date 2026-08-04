@@ -47,6 +47,12 @@ GOLDEN_SYSTEM = """You are a SQL expert. Generate {n} diverse golden SQL queries
 for the following database schema. Cover: simple lookups, aggregations, filters,
 group-bys, ordering, and edge cases (empty results, max/min, counts).
 
+CRITICAL SQL RULES:
+- ALWAYS wrap text column comparisons in LOWER(): LOWER(col) = LOWER('value')
+- NEVER use bare equality for string filters: Channel = 'retail' -> LOWER(Channel) = 'retail'
+- For LIKE patterns, use: LOWER(col) LIKE LOWER('%pattern%')
+- Always add IS NOT NULL filters for aggregation columns.
+
 Schema:
 {schema}
 
