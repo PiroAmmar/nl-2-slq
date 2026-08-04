@@ -79,9 +79,7 @@ def _generate_answer(
     if result.df is None or result.df.empty:
         preview = "Empty result set — no matching rows were found."
     else:
-        preview = result.df.head(150).to_string(index=False)
-        if len(result.df) > 150:
-            preview += f"\n\n... (and {len(result.df) - 150} more rows)"
+        preview = result.df.to_string(index=False)
 
     user_content = (
         f"Question: {question}\n\n"
