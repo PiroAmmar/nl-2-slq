@@ -92,6 +92,62 @@ df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M:%S")
 
 ---
 
-## 15. Single-value results shown as bare dataframe
-**Bug:** Single scalar result (e.g. "total sales") rendered in full dataframe widget — ugly.
-**Fix:** `row_count == 1 and len(cols) == 1` — `st.metric()` card instead.
+## 16. Fallback placeholder answer cached as if it were real
+**Bug:** `_generate_answer()` in `responder.py` caught any `call_llm()` exception (including
+`CallBudget` exhaustion) and silently returned `"Retrieved {n} row(s). See the table below for
+details."` — `app.py` then wrote this generic string into ChromaDB via `golden_cache.store_golden()`
+with no check that it was a real LLM answer.
+**Impact:** Once cached, every future question with cosine similarity ≥ 0.88 replayed the same
+broken placeholder forever, even after the underlying pipeline bug was fixed. Root trigger was
+usually a case-sensitive string filter (`Channel = 'retail'` vs stored `'Retail'`) causing a 0-row
+result → verifier rejection → regeneration loop → `CallBudget` exhausted before Step 5.
+**Fix:** `_generate_answer()` / `generate_response()` now return `(text, is_real_answer)`.
+`app.py` only calls `golden_cache.store_golden()` when `is_real_answer is True`.
+
+---
+
+## 17. `CallBudget(max_calls=8)` too tight for large schemas
+**Bug:** 10-table schema → 2-pass table/field selection (2 calls) + triage (1) + initial SQL gen (1)
+= 4 calls before execution even starts. Two regeneration cycles (verifier rejection) cost 2 calls
+each, pushing total usage to 8+ before Step 5 (responder) ever runs — see #16.
+**Fix:** Raised `CallBudget(max_calls=8)` → `12` in `app.py::_run_pipeline`.
+
+---
+
+## 18. Golden queries regenerated on every chat message, not just on upload
+**Bug:** `if uploaded:` block in `app.py` ran on every Streamlit script rerun — which happens on
+every chat message, not just on file upload — because `st.file_uploader` keeps returning the same
+`UploadedFile` across reruns as long as it's still shown in the widget. `st.session_state.golden_ready`
+existed but was never checked as a guard; it was unconditionally reset to `False` and the whole
+upload-processing block (DB rebuild, schema reload, `st.session_state.messages = []`, golden-query
+generation) re-ran every turn. Confirmed in production logs: `[golden-gen]` fired twice for the same
+`dataset_hash` a minute apart with no re-upload in between.
+**Impact:** Wasted Groq + embedding calls every question, extra latency, and silently wiped chat
+history (`messages = []`) on every turn.
+**Fix:** Compute `dataset_hash` first (cheap), skip the entire upload-processing block when
+`dataset_hash == st.session_state.dataset_hash and st.session_state.golden_ready` is already true.
+
+---
+
+## 19. Cache-hit answers rendered with `st.write` instead of `st.markdown`
+**Bug:** Mistake #12 fixed `st.write` → `st.markdown` for the main pipeline response, but missed
+the semantic-cache-hit render path — cached answers showed raw `**bold**`/bullet markdown as plain
+text instead of rendering it.
+**Fix:** `st.write(hit["answer"])` → `st.markdown(hit["answer"])` in the cache-hit branch.
+
+---
+
+## 20. `use_container_width` deprecated in Streamlit
+**Bug:** `use_container_width=True` on `st.plotly_chart` / `st.dataframe` throws a deprecation
+warning every run (removed after 2025-12-31).
+**Fix:** Replaced with `width="stretch"` at all three call sites.
+
+---
+
+## 21. Hardcoded absolute Windows path for sql-guide skill
+**Known issue (not yet fixed):** `generator.py` loads
+`C:\Users\Syed Ammar Ali\.gemini\config\skills\sql-guide\SKILL.md` — works locally but silently
+falls back to `_SQL_GUIDE = ""` (with only a log warning) on any other machine, CI runner, or
+deployment target. Should be replaced with an env var (e.g. `SQL_GUIDE_PATH`) with the current
+path as a default, or a path relative to the repo.
+
