@@ -40,7 +40,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── constants ─────────────────────────────────────────────────────────────────
-DEFAULT_DB = os.path.join(os.path.dirname(__file__), "students.db")
 GOLDEN_QUERY_COUNT = 10
 
 GOLDEN_SYSTEM = """You are a SQL expert. Generate {n} diverse golden SQL queries
@@ -99,9 +98,9 @@ def _schema_to_text(schema: dict[str, list[str]]) -> str:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "db_path" not in st.session_state:
-    st.session_state.db_path = DEFAULT_DB
+    st.session_state.db_path = None
 if "schema" not in st.session_state:
-    st.session_state.schema = _get_schema(DEFAULT_DB)
+    st.session_state.schema = {}
 if "dataset_hash" not in st.session_state:
     st.session_state.dataset_hash = "default"
 if "golden_ready" not in st.session_state:
@@ -363,6 +362,14 @@ with st.sidebar:
 
                 conn.close()
 
+                # Clean up the previous temp db to prevent disk leaks
+                old_db = st.session_state.get("db_path")
+                if old_db and os.path.exists(old_db):
+                    try:
+                        os.remove(old_db)
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up old temp db {old_db}: {e}")
+
                 st.session_state.db_path = tmp.name
                 st.session_state.schema = _get_schema(tmp.name)
                 st.session_state.dataset_hash = dataset_hash
@@ -400,6 +407,10 @@ for msg in st.session_state.messages:
 
 # ── chat input ────────────────────────────────────────────────────────────────
 if question := st.chat_input("Ask a question about your data…"):
+    if not st.session_state.get("db_path"):
+        st.info("Please upload a dataset from the sidebar first before asking questions.")
+        st.stop()
+        
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.write(question)

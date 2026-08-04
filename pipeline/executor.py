@@ -149,7 +149,7 @@ def _run_sql(sql: str, db_path: str) -> ExecutionResult:
             col_metadata=col_meta,
         )
 
-    except sqlite3.OperationalError as exc:
+    except Exception as exc:
         err_str = str(exc)
         error_type = _classify_error(err_str)
         return ExecutionResult(
@@ -157,13 +157,6 @@ def _run_sql(sql: str, db_path: str) -> ExecutionResult:
             sql=sql,
             error=err_str,
             error_type=error_type,
-        )
-    except Exception as exc:
-        return ExecutionResult(
-            success=False,
-            sql=sql,
-            error=str(exc),
-            error_type="unknown",
         )
 
 

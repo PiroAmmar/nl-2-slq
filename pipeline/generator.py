@@ -16,16 +16,17 @@ from pipeline.llm import CallBudget, call_llm
 
 logger = logging.getLogger(__name__)
 
-_SKILL_PATH = os.getenv(
-    "SQL_GUIDE_PATH",
-    r"C:\Users\Syed Ammar Ali\.gemini\config\skills\sql-guide\SKILL.md",
-)
+_SKILL_PATH = os.getenv("SQL_GUIDE_PATH")
 try:
-    with open(_SKILL_PATH, encoding="utf-8") as f:
-        _SQL_GUIDE = f.read()
+    if _SKILL_PATH:
+        with open(_SKILL_PATH, encoding="utf-8") as f:
+            _SQL_GUIDE = f.read()
+    else:
+        _SQL_GUIDE = ""
+        logger.warning("SQL_GUIDE_PATH environment variable not set — SQL generation will run without it.")
 except FileNotFoundError:
     _SQL_GUIDE = ""
-    logger.warning("sql_guide_skill.md not found — SQL generation will run without it.")
+    logger.warning("sql_guide_skill.md not found at %s — SQL generation will run without it.", _SKILL_PATH)
 
 _SYSTEM = f"""You are an expert SQL developer specialising in SQLite.
 Generate SQL queries that precisely answer the user's question using ONLY the
@@ -43,7 +44,7 @@ Output rules:
 - Parameterised values only — no string concatenation.
 
 String comparison rules (CRITICAL — prevents silent empty results):
-- ALWAYS wrap text column comparisons in LOWER(): LOWER(col) = LOWER('value')
+- ALWAYS wrap text column comparisons (including JOIN conditions) in LOWER(): LOWER(t1.col) = LOWER(t2.col)
 - NEVER use bare equality for string filters: Channel = 'retail' → LOWER(Channel) = 'retail'
 - For LIKE patterns, use: LOWER(col) LIKE LOWER('%pattern%')
 - For IN lists, use: LOWER(col) IN ('value1', 'value2')
@@ -51,6 +52,7 @@ String comparison rules (CRITICAL — prevents silent empty results):
 Date/time rules:
 - SQLite stores dates as TEXT (ISO 8601: 'YYYY-MM-DD HH:MM:SS') or as REAL (Julian day).
 - Use strftime('%Y-%m-%d', col) to normalise before comparing: strftime('%Y-%m', date_col) = '2025-01'
+- When joining tables on dates or months, normalise BOTH sides using strftime: strftime('%Y-%m', t1.Date) = strftime('%Y-%m', t2.Month)
 - For year/month extraction always use strftime, not YEAR() or MONTH() (those don't exist in SQLite).
 - When filtering a date range use: date_col BETWEEN '2025-01-01' AND '2025-12-31'
 

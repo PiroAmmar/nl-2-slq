@@ -16,7 +16,7 @@ from groq import Groq
 
 logger = logging.getLogger(__name__)
 
-GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_MODEL = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
 
 _client: Groq | None = None
 
@@ -81,7 +81,6 @@ def call_llm(
                 temperature=temperature,
                 max_completion_tokens=max_tokens,
                 top_p=0.95,
-                reasoning_effort="low",
                 stream=False,
                 stop=None,
             )
