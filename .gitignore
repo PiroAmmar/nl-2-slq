@@ -12,6 +12,8 @@ venv/
 
 # Environment variables
 .env
+.python-version
+
 
 # Local data stores
 chroma_store/
