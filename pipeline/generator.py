@@ -16,9 +16,9 @@ from pipeline.llm import CallBudget, call_llm
 
 logger = logging.getLogger(__name__)
 
-# Load sql-guide skill from global skills folder (no local copy needed)
-_SKILL_PATH = os.path.expandvars(
-    r"C:\Users\Syed Ammar Ali\.gemini\config\skills\sql-guide\SKILL.md"
+_SKILL_PATH = os.getenv(
+    "SQL_GUIDE_PATH",
+    r"C:\Users\Syed Ammar Ali\.gemini\config\skills\sql-guide\SKILL.md",
 )
 try:
     with open(_SKILL_PATH, encoding="utf-8") as f:
