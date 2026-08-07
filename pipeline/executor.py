@@ -22,7 +22,6 @@ from pipeline.llm import CallBudget, call_llm
 logger = logging.getLogger(__name__)
 
 MAX_EXECUTION_RETRIES = 3   # retry loop cap (syntax/schema errors)
-MAX_REGENERATIONS = 2       # regeneration loop cap (verifier rejections)
 QUERY_TIMEOUT_MS = 12_000   # 12 s
 ROW_LIMIT = 500
 
@@ -58,7 +57,6 @@ def execute_and_verify(
     """
     sql = initial_sql
     exec_attempts = 0
-    regen_attempts = 0
     need_reselect = False  # flag: schema error → caller should re-run selector
 
     # ── execution + retry loop ────────────────────────────────────────────────
@@ -90,31 +88,9 @@ def execute_and_verify(
             )
             continue
 
-        # ── verification pass ─────────────────────────────────────────────────
-        verdict = _verify(question, sql, result, budget)
-
-        if verdict["ok"]:
-            logger.info("Verification passed. Row count: %d", result.row_count)
-            return result
-
-        # Verifier rejected — regenerate
-        regen_attempts += 1
-        if regen_attempts > MAX_REGENERATIONS:
-            logger.warning("Regeneration cap reached — returning last result anyway.")
-            return result
-
-        logger.info(
-            "Verifier rejected (regen %d/%d): %s",
-            regen_attempts, MAX_REGENERATIONS, verdict["reason"],
-        )
-        sql = generate_sql_fn(
-            question=question,
-            selected_schema=selected_schema,
-            budget=budget,
-            prior_sql=sql,
-            verifier_reasoning=verdict["reason"],
-        )
-        exec_attempts = 0  # reset execution counter for regenerated SQL
+        # ── if we reach here, execution succeeded ─────────────────────────────
+        logger.info("Execution succeeded. Row count: %d", result.row_count)
+        return result
 
     # Should not reach here
     return ExecutionResult(
@@ -132,6 +108,11 @@ def _run_sql(sql: str, db_path: str) -> ExecutionResult:
     sql = _inject_limit(sql)
 
     try:
+        # Static BI Validation
+        sql_upper = sql.upper()
+        if re.search(r"AVG\s*\([^)]+/[^)]+\)", sql_upper):
+            raise ValueError("CRITICAL BI ERROR: Calculated average of a ratio (e.g. AVG(A/B)). You must calculate the ratio of the sums: SUM(A)/SUM(B).")
+
         # Read-only URI
         uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=QUERY_TIMEOUT_MS / 1000)
@@ -181,43 +162,4 @@ def _classify_error(err: str) -> str:
     return "unknown"
 
 
-_VERIFY_SYSTEM = """You are a SQL result verifier.
-Given a user question, the SQL used, and a preview of the results, decide if the
-result plausibly and correctly answers the question.
 
-Reply with ONLY valid JSON (no markdown):
-{"ok": true | false, "reason": "<one sentence — why it passes or fails>"}"""
-
-
-def _verify(
-    question: str,
-    sql: str,
-    result: ExecutionResult,
-    budget: CallBudget,
-) -> dict:
-    """Ask the LLM if the returned rows plausibly answer the question."""
-    preview_rows = (
-        result.df.head(10).to_string(index=False) if result.df is not None else "No rows"
-    )
-    user_content = (
-        f"Question: {question}\n\n"
-        f"SQL:\n{sql}\n\n"
-        f"Row count: {result.row_count}\n"
-        f"Preview (first 10 rows):\n{preview_rows}"
-    )
-    try:
-        raw = call_llm(
-            messages=[
-                {"role": "system", "content": _VERIFY_SYSTEM},
-                {"role": "user", "content": user_content},
-            ],
-            step="verifier",
-            budget=budget,
-            max_tokens=120,
-            temperature=0.0,
-        )
-        parsed = json.loads(raw)
-        return {"ok": bool(parsed.get("ok", True)), "reason": parsed.get("reason", "")}
-    except Exception as exc:
-        logger.warning("Verifier call/parse failed (%s) — treating as OK.", exc)
-        return {"ok": True, "reason": "verifier skipped"}

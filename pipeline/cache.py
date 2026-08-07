@@ -47,10 +47,15 @@ def store_golden(
     sqls: list[str],
     answers: list[str],
     embeddings: list[list[float]],
+    metadata_extra: list[dict] | None = None,
 ) -> None:
     """
     Bulk-insert golden query triples into the collection for this dataset.
     Skips entries already stored (idempotent by question text as ID).
+
+    metadata_extra: optional list of dicts (same length as questions) with
+    additional metadata fields to merge per entry, e.g.
+    [{"source_type": "doc_qa", "source_pdf": "...", "source_page": 3}]
     """
     if not questions:
         return
@@ -61,13 +66,46 @@ def store_golden(
     )
 
     ids = [hashlib.md5(q.encode()).hexdigest() for q in questions]
+    base_metas = [{"sql": s, "answer": a} for s, a in zip(sqls, answers)]
+    if metadata_extra:
+        for base, extra in zip(base_metas, metadata_extra):
+            base.update(extra)
     col.upsert(
         ids=ids,
         embeddings=embeddings,
         documents=questions,
-        metadatas=[{"sql": s, "answer": a} for s, a in zip(sqls, answers)],
+        metadatas=base_metas,
     )
-    logger.info("Stored %d golden queries for dataset %s", len(questions), dataset_hash[:8])
+    logger.info("Stored %d entries for dataset %s", len(questions), dataset_hash[:8])
+
+
+def store_doc_qa(
+    dataset_hash: str,
+    questions: list[str],
+    sqls: list[str],
+    answers: list[str],
+    embeddings: list[list[float]],
+    page_meta: list[dict],
+) -> None:
+    """
+    Store doc-sourced Q&A entries with source_type="doc_qa" metadata.
+
+    page_meta: [{source_pdf, source_page, role, section}] — same order as questions.
+    """
+    extra = [
+        {
+            "source_type": "doc_qa",
+            "source_pdf": m.get("source_pdf", ""),
+            "source_page": m.get("source_page", 0),
+            "role": m.get("role", ""),
+            "section": m.get("section", ""),
+        }
+        for m in page_meta
+    ]
+    store_golden(dataset_hash, questions, sqls, answers, embeddings, metadata_extra=extra)
+    logger.info(
+        "Stored %d doc_qa entries for dataset %s", len(questions), dataset_hash[:8]
+    )
 
 
 # ── lookup ────────────────────────────────────────────────────────────────────
@@ -116,11 +154,17 @@ def lookup(
         similarity,
         results["documents"][0][0][:60],
     )
+    # Return all stored metadata so callers can use source_pdf/source_page etc.
     return {
         "question": results["documents"][0][0],
-        "sql": meta["sql"],
-        "answer": meta["answer"],
+        "sql": meta.get("sql", ""),
+        "answer": meta.get("answer", ""),
         "similarity": similarity,
+        "source_type": meta.get("source_type"),        # "doc_qa" | None
+        "source_pdf": meta.get("source_pdf"),
+        "source_page": meta.get("source_page"),
+        "role": meta.get("role"),
+        "section": meta.get("section"),
     }
 
 

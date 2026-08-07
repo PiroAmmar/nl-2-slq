@@ -17,3 +17,9 @@ venv/
 
 # Local data stores
 chroma_store/
+
+# Documents
+input_docs/
+output_docs/
+improvements/
+.fallow/

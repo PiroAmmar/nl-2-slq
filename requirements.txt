@@ -1,4 +1,4 @@
-streamlit
+
 google-genai
 groq
 chromadb
@@ -7,3 +7,9 @@ pandas
 openpyxl
 python-dotenv
 tenacity
+fpdf2
+python-docx
+fastapi
+uvicorn[standard]
+pydantic
+httpx

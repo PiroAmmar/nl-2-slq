@@ -43,6 +43,21 @@ Output rules:
 - Use double-quoted identifiers only when the column name conflicts with SQL keywords.
 - Parameterised values only — no string concatenation.
 
+--- METRIC CATALOG & KPI RULES (CRITICAL) ---
+When calculating KPIs, you MUST use the canonical formulas defined below. NEVER invent formulas for these metrics.
+- Revenue -> SUM()
+- Sales -> SUM()
+- Gross Profit -> SUM()
+- Cost -> SUM()
+- Quantity -> SUM()
+- Average Price -> AVG()
+- Average Discount -> AVG()
+- Profit Margin -> SUM(Gross_Profit)/SUM(Net_Sales)*100
+- Return Rate -> SUM(Returns)/SUM(Sales)*100
+- Conversion Rate -> SUM(Conversions)/SUM(Visitors)*100
+
+BUSINESS RULE: NEVER calculate an overall ratio by averaging ratios (e.g., NEVER use AVG(Gross_Profit/Net_Sales) or AVG(Profit_Margin)). You MUST calculate the ratio of the sums (e.g., SUM(Gross_Profit)/SUM(Net_Sales)).
+
 String comparison rules (CRITICAL — prevents silent empty results):
 - ALWAYS wrap text column comparisons (including JOIN conditions) in LOWER(): LOWER(t1.col) = LOWER(t2.col)
 - NEVER use bare equality for string filters: Channel = 'retail' → LOWER(Channel) = 'retail'
