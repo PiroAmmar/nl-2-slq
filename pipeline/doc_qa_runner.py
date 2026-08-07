@@ -15,6 +15,7 @@ Also importable by FastAPI BackgroundTasks:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -37,19 +38,23 @@ _INPUT_DIR  = os.path.join(os.path.dirname(__file__), "..", "input_docs")
 _BUDGET_PER_Q = 15   # higher than interactive (12) — batch is not latency-sensitive
 
 
-def ingest(
+async def ingest(
     docx_path: str,
     db_path: str,
     schema: dict,
     dataset_hash: str,
+    cancel_event: asyncio.Event | None = None,
 ) -> dict:
     """
     Full ingestion pipeline:
       1. Parse questions from .docx
-      2. Batch-run pipeline per question
+      2. Batch-run pipeline per question (bounded concurrency, shared rate limit)
       3. Write PDF (exact page numbers via fpdf2)
       4. Embed successes + store in ChromaDB as doc_qa entries
       5. Return run summary
+
+    `cancel_event`, if provided, lets a caller (e.g. server shutdown) stop
+    new questions from starting without killing in-flight ones mid-request.
 
     Returns:
         {total, success_count, failure_count, pdf_path, failures}
@@ -67,12 +72,13 @@ def ingest(
 
     # ── Step 2: Batch run pipeline ────────────────────────────────────────────
     logger.info("[doc_qa] Running %d questions through pipeline", len(questions))
-    successes, failures = run_batch(
+    successes, failures = await run_batch(
         questions=questions,
         db_path=db_path,
         schema=schema,
         dataset_hash=dataset_hash,
         budget_per_q=_BUDGET_PER_Q,
+        cancel_event=cancel_event,
     )
 
     # ── Step 3: PDF generation ────────────────────────────────────────────────
@@ -166,10 +172,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     schema = _schema_from_db(args.db)
-    summary = ingest(
+    summary = asyncio.run(ingest(
         docx_path=args.docx,
         db_path=args.db,
         schema=schema,
         dataset_hash=args.dataset_hash,
-    )
+    ))
     print(json.dumps(summary, indent=2, default=str))

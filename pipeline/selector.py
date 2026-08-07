@@ -28,7 +28,7 @@ Reply with ONLY valid JSON (no markdown):
 _TWO_PASS_THRESHOLD = 2000  # schema char count above which we split into two calls
 
 
-def select_tables_and_fields(
+async def select_tables_and_fields(
     question: str,
     schema: dict[str, list[str]],
     budget: CallBudget,
@@ -39,17 +39,17 @@ def select_tables_and_fields(
     """
     schema_text = _schema_to_text(schema)
     if len(schema_text) > _TWO_PASS_THRESHOLD:
-        return _two_pass(question, schema, budget)
-    return _one_pass(question, schema, schema_text, budget)
+        return await _two_pass(question, schema, budget)
+    return await _one_pass(question, schema, schema_text, budget)
 
 
-def _one_pass(
+async def _one_pass(
     question: str,
     schema: dict[str, list[str]],
     schema_text: str,
     budget: CallBudget,
 ) -> tuple[str, dict[str, list[str]]]:
-    raw = call_llm(
+    raw = await call_llm(
         messages=[
             {"role": "system", "content": _FIELD_SYSTEM},
             {
@@ -65,14 +65,14 @@ def _one_pass(
     return _parse_fields(raw, schema)
 
 
-def _two_pass(
+async def _two_pass(
     question: str,
     schema: dict[str, list[str]],
     budget: CallBudget,
 ) -> tuple[str, dict[str, list[str]]]:
     # Pass 1: table names only
     table_list = "\n".join(f"- {t}" for t in schema)
-    raw1 = call_llm(
+    raw1 = await call_llm(
         messages=[
             {"role": "system", "content": _TABLE_SYSTEM},
             {
@@ -95,7 +95,7 @@ def _two_pass(
 
     # Pass 2: fields on pruned schema
     pruned = {t: schema[t] for t in selected}
-    raw2 = call_llm(
+    raw2 = await call_llm(
         messages=[
             {"role": "system", "content": _FIELD_SYSTEM},
             {

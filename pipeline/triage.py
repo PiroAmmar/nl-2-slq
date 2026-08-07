@@ -24,12 +24,12 @@ Reply with ONLY valid JSON, no markdown fences:
 {"category": "data" | "general" | "out_of_scope", "reason": "<one short sentence>"}"""
 
 
-def classify_query(question: str, budget: CallBudget) -> str:
+async def classify_query(question: str, budget: CallBudget) -> str:
     """
     Returns "data", "general", or "out_of_scope".
     Falls back to "data" on parse error to keep pipeline unblocked.
     """
-    raw = call_llm(
+    raw = await call_llm(
         messages=[
             {"role": "system", "content": _SYSTEM},
             {"role": "user", "content": question},

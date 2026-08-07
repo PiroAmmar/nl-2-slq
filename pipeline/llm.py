@@ -1,31 +1,75 @@
 """
-pipeline/llm.py — Single Groq LLM wrapper for all pipeline steps.
+pipeline/llm.py — Single async Groq LLM wrapper for all pipeline steps.
 
 All stages (triage, selection, SQL generation, verification, response)
 go through call_llm(). Per-question call budget enforced here.
+
+Async end-to-end: retry backoff uses asyncio.sleep (never blocks a thread),
+and a process-wide RateLimiter throttles outbound requests to stay under
+Groq's RPM ceiling regardless of how many questions/jobs run concurrently.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-import time
 import random
+import time
 
-from groq import Groq
+from groq import AsyncGroq
 
 logger = logging.getLogger(__name__)
 
 GROQ_MODEL = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
 
-_client: Groq | None = None
+# Groq free/dev tier is commonly RPM-limited well below what a naive loop
+# sends. Override via env for paid tiers. This is a *ceiling*, not a target —
+# keeping it conservative is what actually stops the 429 storm.
+GROQ_RPM_LIMIT = int(os.getenv("GROQ_RPM_LIMIT", "28"))
+
+_client: AsyncGroq | None = None
 
 
-def _get_client() -> Groq:
+def _get_client() -> AsyncGroq:
     global _client
     if _client is None:
-        _client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        _client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
     return _client
+
+
+# ── process-wide rate limiter ──────────────────────────────────────────────
+# Sliding-window limiter shared by every caller in this process (interactive
+# /query requests AND background doc_qa jobs). This is what actually keeps
+# us under Groq's RPM — a per-question sleep does not, because concurrent
+# jobs/requests each apply their own delay independently.
+
+class RateLimiter:
+    """Async sliding-window rate limiter: at most `limit` calls per `period`s."""
+
+    def __init__(self, limit: int, period: float = 60.0):
+        self.limit = limit
+        self.period = period
+        self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                self._timestamps = [t for t in self._timestamps if now - t < self.period]
+                if len(self._timestamps) < self.limit:
+                    self._timestamps.append(now)
+                    return
+                wait = self.period - (now - self._timestamps[0])
+                logger.debug("[rate-limiter] at capacity, waiting %.2fs", wait)
+                # Lock stays held across the sleep on purpose: admission is
+                # serialized once we're at capacity, so callers queue up and
+                # each re-checks the window on wake rather than stampeding.
+                await asyncio.sleep(max(wait, 0.05))
+
+
+_rate_limiter = RateLimiter(GROQ_RPM_LIMIT)
 
 
 # ── per-question call budget ──────────────────────────────────────────────────
@@ -50,7 +94,7 @@ class CallBudget:
 
 # ── core wrapper ──────────────────────────────────────────────────────────────
 
-def call_llm(
+async def call_llm(
     *,
     messages: list[dict[str, str]],
     step: str,
@@ -60,10 +104,11 @@ def call_llm(
     max_retries: int = 4,
 ) -> str:
     """
-    Call Groq and return the response text.
+    Call Groq (async) and return the response text.
 
-    Retries on 429/5xx with exponential backoff + jitter.
-    Respects Retry-After header when present.
+    Retries on 429/5xx with exponential backoff + jitter, via asyncio.sleep
+    so a blocked retry never ties up an OS thread. Respects Retry-After
+    when present. Every call passes through the shared RateLimiter first.
     Raises RuntimeError on budget exhaustion or permanent failure.
     """
     budget.consume(step)
@@ -74,8 +119,9 @@ def call_llm(
     last_error: Exception | None = None
 
     while attempt <= max_retries:
+        await _rate_limiter.acquire()
         try:
-            completion = client.chat.completions.create(
+            completion = await client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=messages,  # type: ignore[arg-type]
                 temperature=temperature,
@@ -113,7 +159,7 @@ def call_llm(
                 "[%s] Groq transient error (attempt %d/%d), waiting %.1fs: %s",
                 step, attempt + 1, max_retries, wait, exc,
             )
-            time.sleep(wait)
+            await asyncio.sleep(wait)
             attempt += 1
 
     raise RuntimeError(

@@ -13,7 +13,6 @@ import logging
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
 
 from pipeline.executor import ExecutionResult
 from pipeline.llm import CallBudget, call_llm
@@ -50,7 +49,7 @@ LARGE_RESULT_THRESHOLD = 5_000  # rows above which scatter/line gets down-sample
 
 # ── public entry point ────────────────────────────────────────────────────────
 
-def generate_response(
+async def generate_response(
     question: str,
     result: ExecutionResult,
     budget: CallBudget,
@@ -61,7 +60,7 @@ def generate_response(
     is_real_answer is False when the LLM call failed and a generic
     placeholder was returned instead — callers should NOT cache that.
     """
-    nl_answer, is_real_answer = _generate_answer(question, result, budget)
+    nl_answer, is_real_answer = await _generate_answer(question, result, budget)
     fig = None
 
     if result.df is not None and not result.df.empty:
@@ -74,7 +73,7 @@ def generate_response(
 
 # ── NL answer ─────────────────────────────────────────────────────────────────
 
-def _generate_answer(
+async def _generate_answer(
     question: str,
     result: ExecutionResult,
     budget: CallBudget,
@@ -92,7 +91,7 @@ def _generate_answer(
         f"Result preview:\n{preview}"
     )
     try:
-        draft = call_llm(
+        draft = await call_llm(
             messages=[
                 {"role": "system", "content": _ANSWER_SYSTEM},
                 {"role": "user", "content": user_content},

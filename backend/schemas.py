@@ -70,7 +70,7 @@ class DocQAIngestResponse(BaseModel):
 
 class DocQAStatusResponse(BaseModel):
     job_id: str
-    status: str                            # "running" | "done" | "failed"
+    status: str                            # "queued" | "running" | "done" | "failed" | "cancelled"
     total: Optional[int] = None
     success_count: Optional[int] = None
     failure_count: Optional[int] = None

@@ -7,7 +7,7 @@ Usage:
 parse_questions(docx_path) -> list[dict]
     Returns: [{question, role, section}]
 
-run_batch(questions, db_path, schema, dataset_hash, budget_per_q=15)
+await run_batch(questions, db_path, schema, dataset_hash, budget_per_q=15)
     Returns: (successes, failures)
     successes: [{question, sql, answer, role, section}]
     failures:  [{question, role, section, reason}]
@@ -15,9 +15,8 @@ run_batch(questions, db_path, schema, dataset_hash, budget_per_q=15)
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import time
-import random
 
 from docx import Document
 
@@ -30,9 +29,10 @@ from pipeline.responder import generate_response
 
 logger = logging.getLogger(__name__)
 
-# Seconds to wait between questions — respects Groq rate limits (§7 Prompt.md)
-_INTER_QUESTION_DELAY_S = 2.0
-_JITTER_S = 0.5
+# How many questions run concurrently. The real throttle against Groq's RPM
+# lives in pipeline.llm's shared RateLimiter — this cap just bounds memory/
+# connection usage and keeps logs readable. Tune independently of RPM.
+_MAX_CONCURRENT_QUESTIONS = 5
 
 
 def parse_questions(docx_path: str) -> list[dict]:
@@ -109,92 +109,108 @@ def parse_questions(docx_path: str) -> list[dict]:
     return questions
 
 
-def run_batch(
+async def run_batch(
     questions: list[dict],
     db_path: str,
     schema: dict,
     dataset_hash: str,
     budget_per_q: int = 15,
+    cancel_event: asyncio.Event | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Run every question through the full pipeline (Steps 1-5).
+    Run every question through the full pipeline (Steps 1-5), concurrently
+    (bounded by _MAX_CONCURRENT_QUESTIONS). Actual outbound-request pacing
+    against Groq is enforced centrally by pipeline.llm's RateLimiter, so
+    raising concurrency here does not risk more 429s — it just lets already
+    rate-limited requests overlap their non-network work (parsing, retries
+    waiting on backoff, sqlite I/O) instead of queueing behind one another.
 
-    Rate-limited: waits _INTER_QUESTION_DELAY_S + jitter between questions.
+    If `cancel_event` is set (e.g. on server shutdown), in-flight questions
+    finish but no new ones start, and the loop returns early with whatever
+    completed so far collected as failures/successes.
+
     Failed questions (never passed verification, budget exhausted, etc.) are
     collected in `failures` — never silently dropped.
 
     Returns:
-        successes: [{question, sql, answer, role, section, is_real_answer}]
+        successes: [{question, sql, answer, role, section}]
         failures:  [{question, role, section, reason}]
     """
-    successes: list[dict] = []
-    failures: list[dict] = []
     total = len(questions)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_QUESTIONS)
+    results: list[dict | None] = [None] * total
 
-    for idx, item in enumerate(questions):
+    async def _worker(idx: int, item: dict) -> None:
         q = item["question"]
         role = item["role"]
         section = item["section"]
-        logger.info("[batch %d/%d] Running: %s", idx + 1, total, q[:80])
 
-        try:
-            result_entry = _run_single(q, db_path, schema, dataset_hash, budget_per_q)
-            if result_entry is None:
-                failures.append(
-                    {
-                        "question": q,
-                        "role": role,
-                        "section": section,
+        if cancel_event is not None and cancel_event.is_set():
+            results[idx] = {
+                "kind": "failure",
+                "question": q, "role": role, "section": section,
+                "reason": "Job cancelled (server shutdown) before this question started.",
+            }
+            return
+
+        async with semaphore:
+            if cancel_event is not None and cancel_event.is_set():
+                results[idx] = {
+                    "kind": "failure",
+                    "question": q, "role": role, "section": section,
+                    "reason": "Job cancelled (server shutdown) before this question started.",
+                }
+                return
+
+            logger.info("[batch %d/%d] Running: %s", idx + 1, total, q[:80])
+            try:
+                result_entry = await _run_single(q, db_path, schema, dataset_hash, budget_per_q)
+                if result_entry is None:
+                    results[idx] = {
+                        "kind": "failure",
+                        "question": q, "role": role, "section": section,
                         "reason": "Pipeline returned no result (triage/out-of-scope)",
                     }
-                )
-            elif not result_entry.get("is_real_answer"):
-                failures.append(
-                    {
-                        "question": q,
-                        "role": role,
-                        "section": section,
+                elif not result_entry.get("is_real_answer"):
+                    results[idx] = {
+                        "kind": "failure",
+                        "question": q, "role": role, "section": section,
                         "reason": "Fallback/placeholder answer — not a real LLM answer",
                     }
-                )
-            else:
-                successes.append(
-                    {
+                else:
+                    results[idx] = {
+                        "kind": "success",
                         "question": q,
                         "sql": result_entry["sql"],
                         "answer": result_entry["answer"],
                         "role": role,
                         "section": section,
                     }
-                )
-        except Exception as exc:
-            logger.warning("[batch %d/%d] Failed: %s — %s", idx + 1, total, q[:60], exc)
-            failures.append(
-                {
-                    "question": q,
-                    "role": role,
-                    "section": section,
+            except Exception as exc:
+                logger.warning("[batch %d/%d] Failed: %s — %s", idx + 1, total, q[:60], exc)
+                results[idx] = {
+                    "kind": "failure",
+                    "question": q, "role": role, "section": section,
                     "reason": str(exc),
                 }
-            )
 
-        # Rate-limit pause between questions (skip after last question)
-        if idx < total - 1:
-            wait = _INTER_QUESTION_DELAY_S + random.uniform(0, _JITTER_S)
-            time.sleep(wait)
+    await asyncio.gather(*(_worker(i, item) for i, item in enumerate(questions)))
+
+    successes = [r for r in results if r and r["kind"] == "success"]
+    failures = [r for r in results if r and r["kind"] == "failure"]
+    for r in successes + failures:
+        r.pop("kind", None)
 
     logger.info(
         "[batch] Done. %d succeeded, %d failed out of %d total.",
-        len(successes),
-        len(failures),
-        total,
+        len(successes), len(failures), total,
     )
     return successes, failures
 
 
 # ── internals ─────────────────────────────────────────────────────────────────
 
-def _run_single(
+async def _run_single(
     question: str,
     db_path: str,
     schema: dict,
@@ -205,19 +221,19 @@ def _run_single(
     budget = CallBudget(max_calls=budget_per_q)
 
     # Step 1/2: Triage + Table/field selection
-    status, selected_schema = select_tables_and_fields(question, schema, budget)
+    status, selected_schema = await select_tables_and_fields(question, schema, budget)
     if status != "ok":
         logger.info("[batch] Skipped (triage=%s): %s", status, question[:60])
         return None
 
     # Step 3: Initial SQL generation
-    sql = generate_sql(question, selected_schema, budget)
+    sql = await generate_sql(question, selected_schema, budget)
 
     # Step 4: Execution + verification
-    def _gen_fn(**kwargs):
-        return generate_sql(**kwargs)
+    async def _gen_fn(**kwargs):
+        return await generate_sql(**kwargs)
 
-    result = execute_and_verify(
+    result = await execute_and_verify(
         question=question,
         initial_sql=sql,
         selected_schema=selected_schema,
@@ -232,7 +248,7 @@ def _run_single(
         )
 
     # Step 5: Response generation
-    nl_answer, _fig, is_real_answer = generate_response(question, result, budget)
+    nl_answer, _fig, is_real_answer = await generate_response(question, result, budget)
 
     return {
         "sql": result.sql,

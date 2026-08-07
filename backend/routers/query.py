@@ -58,7 +58,7 @@ async def ask_question(req: QueryRequest) -> QueryResponse:
 
     # ── Step 1/2: Triage + Selection ───────────────────────────────────────────
     try:
-        status, selected_schema = select_tables_and_fields(question, schema, budget)
+        status, selected_schema = await select_tables_and_fields(question, schema, budget)
         if status != "ok":
             return QueryResponse(
                 answer=f"This question appears to be {status}. I can only answer questions related to the dataset.",
@@ -69,16 +69,16 @@ async def ask_question(req: QueryRequest) -> QueryResponse:
 
     # ── Step 3: SQL generation ─────────────────────────────────────────────────
     try:
-        sql = generate_sql(question, selected_schema, budget)
+        sql = await generate_sql(question, selected_schema, budget)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
     # ── Step 4: Execution + verification ───────────────────────────────────────
-    def _gen_fn(**kwargs):
-        return generate_sql(**kwargs)
+    async def _gen_fn(**kwargs):
+        return await generate_sql(**kwargs)
 
     try:
-        result = execute_and_verify(
+        result = await execute_and_verify(
             question=question,
             initial_sql=sql,
             selected_schema=selected_schema,
@@ -97,7 +97,7 @@ async def ask_question(req: QueryRequest) -> QueryResponse:
 
     # ── Step 5: NL response + chart ────────────────────────────────────────────
     try:
-        nl_answer, fig, is_real_answer = generate_response(question, result, budget)
+        nl_answer, fig, is_real_answer = await generate_response(question, result, budget)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

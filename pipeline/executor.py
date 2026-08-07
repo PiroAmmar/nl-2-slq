@@ -9,6 +9,7 @@ ExecutionResult carries everything downstream (3.5 + visualization) needs.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -41,14 +42,14 @@ class ExecutionResult:
 
 # ── public entry point ────────────────────────────────────────────────────────
 
-def execute_and_verify(
+async def execute_and_verify(
     question: str,
     initial_sql: str,
     selected_schema: dict[str, list[str]],
     db_path: str,
     budget: CallBudget,
-    # Pass generator function to avoid circular import
-    generate_sql_fn,  # Callable
+    # Pass generator coroutine function to avoid circular import
+    generate_sql_fn,  # async Callable
 ) -> ExecutionResult:
     """
     Full execution + verification loop.
@@ -62,7 +63,9 @@ def execute_and_verify(
     # ── execution + retry loop ────────────────────────────────────────────────
     while exec_attempts <= MAX_EXECUTION_RETRIES:
         exec_attempts += 1
-        result = _run_sql(sql, db_path)
+        # sqlite I/O is blocking — offload to a worker thread so it never
+        # stalls the event loop when many questions run concurrently.
+        result = await asyncio.to_thread(_run_sql, sql, db_path)
         result.attempts = exec_attempts
 
         if not result.success:
@@ -79,7 +82,7 @@ def execute_and_verify(
                 return result
 
             # Schema errors: flag but still try correction (full re-select is caller's job)
-            sql = generate_sql_fn(
+            sql = await generate_sql_fn(
                 question=question,
                 selected_schema=selected_schema,
                 budget=budget,

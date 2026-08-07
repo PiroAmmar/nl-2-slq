@@ -61,12 +61,12 @@ def _schema_to_text(schema: dict) -> str:
     return "\n".join(f"{t}({', '.join(cols)})" for t, cols in schema.items())
 
 
-def _generate_golden_bg(db_path: str, schema: dict, dataset_id: str) -> None:
+async def _generate_golden_bg(db_path: str, schema: dict, dataset_id: str) -> None:
     """Background task: generate + store golden queries, then mark golden_ready."""
     budget = CallBudget(max_calls=2)
     schema_text = _schema_to_text(schema)
     try:
-        raw = call_llm(
+        raw = await call_llm(
             messages=[{"role": "user", "content": _GOLDEN_SYSTEM.format(n=_GOLDEN_QUERY_COUNT, schema=schema_text)}],
             step="golden-gen",
             budget=budget,

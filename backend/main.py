@@ -11,8 +11,10 @@ Mounts:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -29,10 +31,32 @@ logging.basicConfig(
 
 from backend.routers import datasets, query, dashboard, doc_qa
 
+_SHUTDOWN_GRACE_S = 5.0  # let in-flight questions wrap up before hard-cancelling
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    # ── graceful shutdown: stop doc_qa jobs cleanly instead of dying mid-sleep ──
+    doc_qa.request_all_cancel()
+    tasks = doc_qa.all_running_tasks()
+    if not tasks:
+        return
+    logger.info("Shutdown: waiting up to %.0fs for %d doc_qa job(s) to wind down.", _SHUTDOWN_GRACE_S, len(tasks))
+    _done, pending = await asyncio.wait(tasks, timeout=_SHUTDOWN_GRACE_S)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
     title="NL-to-SQL API",
     description="Natural-language-to-SQL RAG pipeline — FastAPI backend.",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────

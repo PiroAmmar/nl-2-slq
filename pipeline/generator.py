@@ -78,7 +78,7 @@ NULL safety rules:
 """
 
 
-def generate_sql(
+async def generate_sql(
     question: str,
     selected_schema: dict[str, list[str]],
     budget: CallBudget,
@@ -127,7 +127,7 @@ def generate_sql(
         )
         step = "generator-initial"
 
-    raw = call_llm(
+    raw = await call_llm(
         messages=[
             {"role": "system", "content": _SYSTEM},
             {"role": "user", "content": user_content},
