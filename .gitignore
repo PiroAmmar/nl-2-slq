@@ -19,7 +19,7 @@ venv/
 chroma_store/
 
 # Documents
-input_docs/
-output_docs/
+# input_docs/
+# output_docs/
 improvements/
 .fallow/

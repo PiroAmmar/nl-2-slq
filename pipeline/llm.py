@@ -131,9 +131,6 @@ async def call_llm(
                 "stream": False,
                 "stop": None,
             }
-            # Groq supports `reasoning_effort` for its own models only.
-            if not GROQ_MODEL.startswith("openai/"):
-                params["reasoning_effort"] = "low"
             completion = await client.chat.completions.create(**params)
             text = (completion.choices[0].message.content or "").strip()
             logger.info("[%s] Groq call #%d OK (%d chars)", step, budget.used, len(text))
