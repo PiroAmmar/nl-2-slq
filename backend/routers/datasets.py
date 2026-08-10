@@ -22,12 +22,14 @@ from backend import session_store
 from pipeline import cache as golden_cache
 from pipeline.executor import _run_sql
 from pipeline.embedding import call_embedding
-from pipeline.llm import CallBudget, call_llm
+from pipeline.llm import CallBudget, call_llm, BACKGROUND_JOB_SEMAPHORE
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
-_GOLDEN_QUERY_COUNT = 6  # Keep small: each query = 2 LLM calls (SQL + NL)
+# Configurable via env var. Keep ≤6 to use a single LLM call (budget=2).
+# Above 6 the generation is automatically split into chunks of 3 per call.
+_GOLDEN_QUERY_COUNT = int(os.getenv("GOLDEN_QUERY_COUNT", "6"))
 _GOLDEN_SYSTEM = """
 You are a SQL expert. Generate {n} diverse golden SQL queries
 for the following database schema. Cover: simple lookups, aggregations, filters,
@@ -96,122 +98,206 @@ def _get_schema_with_samples(db_path: str, schema: dict[str, list[str]]) -> str:
     return "\n".join(lines)
 
 
-async def _generate_golden_bg(db_path: str, schema: dict, dataset_id: str) -> None:
-    """Background task: generate + store golden queries, then mark golden_ready."""
-    budget = CallBudget(max_calls=2)
-    schema_text = _get_schema_with_samples(db_path, schema)
-    try:
-        raw = await call_llm(
-            messages=[{"role": "user", "content": _GOLDEN_SYSTEM.format(n=_GOLDEN_QUERY_COUNT, schema=schema_text)}],
-            step="golden-gen",
-            budget=budget,
-            max_tokens=1200,
-            temperature=0.3,
-        )
-        gqs = []
-        import re
-        blocks = raw.split("===")
-        for block in blocks:
-            block = block.strip()
-            if not block:
-                continue
-            match = re.search(r"Q:\s*(.*?)\nSQL:\s*(.*)", block, re.DOTALL | re.IGNORECASE)
-            if match:
-                gqs.append({
-                    "question": match.group(1).strip(),
-                    "sql": match.group(2).strip()
-                })
-                
-        if not gqs:
-            logger.error("[golden-gen] Failed to parse delimited output for dataset %s. Raw: %s", dataset_id[:8], raw[:200])
-    except Exception as exc:
-        logger.error("[golden-gen] Failed for dataset %s: %s", dataset_id[:8], exc)
-        return
+async def _generate_golden_bg(
+    db_path: str,
+    schema: dict,
+    dataset_id: str,
+    *,
+    _attempt: int = 1,
+) -> None:
+    """
+    Background task: generate + store golden queries, then mark golden_ready.
 
-    valid_questions = []
-    valid_sqls = []
-    valid_answers = []
+    On total failure (outer exception), schedules one retry after 30 s then gives up.
 
-    for g in gqs:
-        if not isinstance(g, dict) or "question" not in g or "sql" not in g:
-            continue
-        q = g["question"]
-        sql = g["sql"]
-        exec_res = _run_sql(sql, db_path)
-        
-        if exec_res.success and not exec_res.df.empty:
-            try:
-                # Format dataframe as a readable Markdown table
-                df_head = exec_res.df.head()
-                header = "| " + " | ".join(str(c) for c in df_head.columns) + " |"
-                sep = "|" + "|".join(["---"] * len(df_head.columns)) + "|"
-                rows = []
-                for _, row in df_head.iterrows():
-                    rows.append("| " + " | ".join(str(v) for v in row.values) + " |")
-                answer_str = "\n".join([header, sep] + rows)
-            except Exception:
-                answer_str = str(exec_res.df.head())
-                
-            valid_questions.append(q)
-            valid_sqls.append(sql)
-            valid_answers.append(answer_str)
-        else:
-            if not exec_res.success:
-                logger.debug("[golden-gen] Dropping query due to error: %s", exec_res.error)
+    NOTE: The retry is fire-and-forget via asyncio.create_task and is lost if the
+    process restarts during the backoff window — acceptable since there is no
+    job-persistence layer. Do NOT mistake this for a durable retry guarantee.
+    """
+    import re
+
+    # Compute budget: ceil(_GOLDEN_QUERY_COUNT / 3) gen calls + 1 nl-batch call.
+    if _GOLDEN_QUERY_COUNT <= 6:
+        _n_gen_calls = 1
+    else:
+        _n_gen_calls = (_GOLDEN_QUERY_COUNT + 2) // 3  # ceiling division
+    budget = CallBudget(max_calls=_n_gen_calls + 1)
+
+    _total_failure = False
+
+    async with BACKGROUND_JOB_SEMAPHORE:
+        schema_text = _get_schema_with_samples(db_path, schema)
+        try:
+            # ── Chunked golden-query generation ───────────────────────────────────────────
+            # When _GOLDEN_QUERY_COUNT ≤ 6: single call (original behaviour).
+            # When > 6: split into chunks of 3 per call. Partial-chunk failure
+            # is logged and skipped — surviving chunks are still used.
+            # This matches the existing “drop invalid, keep valid” pattern used
+            # in the SQL validation loop below.
+            gqs: list[dict] = []
+            if _GOLDEN_QUERY_COUNT <= 6:
+                chunk_sizes = [_GOLDEN_QUERY_COUNT]
             else:
-                logger.debug("[golden-gen] Dropping query because it returned 0 rows.")
+                chunk_sizes = []
+                remaining = _GOLDEN_QUERY_COUNT
+                while remaining > 0:
+                    c = min(3, remaining)
+                    chunk_sizes.append(c)
+                    remaining -= c
 
-    if not valid_questions:
-        logger.error("[golden-gen] All generated golden queries were invalid or returned 0 rows for dataset %s", dataset_id[:8])
-        session_store.update_golden_ready(dataset_id, True)
-        return
+            for n in chunk_sizes:
+                try:
+                    raw = await call_llm(
+                        messages=[{"role": "user", "content": _GOLDEN_SYSTEM.format(n=n, schema=schema_text)}],
+                        step="golden-gen",
+                        budget=budget,
+                        max_tokens=1200,
+                        temperature=0.3,
+                        priority="background",
+                    )
+                    blocks = raw.split("===")
+                    for block in blocks:
+                        block = block.strip()
+                        if not block:
+                            continue
+                        match = re.search(r"Q:\s*(.*?)\nSQL:\s*(.*)", block, re.DOTALL | re.IGNORECASE)
+                        if match:
+                            gqs.append({
+                                "question": match.group(1).strip(),
+                                "sql": match.group(2).strip(),
+                            })
+                except Exception as chunk_exc:
+                    # Partial failure: skip this chunk, keep surviving chunks.
+                    logger.error(
+                        "[golden-gen] Chunk of %d questions failed for dataset %s — skipping: %s",
+                        n, dataset_id[:8], chunk_exc,
+                    )
 
-    # Convert all markdown tables → natural language in ONE batched LLM call.
-    # Use a numbered format ("1. answer") which is trivial to parse reliably.
-    _NL_BATCH_SYSTEM = (
-        "You are a helpful data analyst. I will give you a numbered list of questions "
-        "and the data retrieved for each. Write a short, natural language answer for each. "
-        "Do NOT show the table or explain SQL. Reply with ONLY numbered answers, one per line:\n"
-        "1. [answer to question 1]\n2. [answer to question 2]\netc."
-    )
-    nl_user_parts = []
-    for i, (q, a) in enumerate(zip(valid_questions, valid_answers), 1):
-        nl_user_parts.append(f"{i}. Question: {q}\nData:\n{a}")
-    nl_user_content = "\n\n".join(nl_user_parts)
+            if not gqs:
+                logger.error(
+                    "[golden-gen] Failed to parse any delimited output for dataset %s.",
+                    dataset_id[:8],
+                )
 
-    try:
-        import re
-        nl_raw = await call_llm(
-            messages=[
-                {"role": "system", "content": _NL_BATCH_SYSTEM},
-                {"role": "user", "content": nl_user_content},
-            ],
-            step="nl-gen-batch",
-            budget=budget,
-            max_tokens=600,
-            temperature=0.2,
-        )
-        # Parse "1. answer", "2. answer" ... lines
-        nl_parsed = re.findall(r"^\d+\.\s+(.+)", nl_raw, re.MULTILINE)
-        if len(nl_parsed) == len(valid_answers):
-            valid_answers = nl_parsed
-            logger.info("[golden-gen] NL batch conversion OK (%d answers)", len(nl_parsed))
-        else:
-            logger.warning(
-                "[golden-gen] NL batch returned %d answers, expected %d — keeping markdown",
-                len(nl_parsed), len(valid_answers)
+            # ── SQL validation loop ──────────────────────────────────────────────────
+            valid_questions: list[str] = []
+            valid_sqls: list[str] = []
+            valid_answers: list[str] = []
+
+            for g in gqs:
+                if not isinstance(g, dict) or "question" not in g or "sql" not in g:
+                    continue
+                q = g["question"]
+                sql = g["sql"]
+                exec_res = _run_sql(sql, db_path)
+
+                if exec_res.success and not exec_res.df.empty:
+                    try:
+                        # Format dataframe as a readable Markdown table
+                        df_head = exec_res.df.head()
+                        header = "| " + " | ".join(str(c) for c in df_head.columns) + " |"
+                        sep = "|" + "|".join(["---"] * len(df_head.columns)) + "|"
+                        rows = []
+                        for _, row in df_head.iterrows():
+                            rows.append("| " + " | ".join(str(v) for v in row.values) + " |")
+                        answer_str = "\n".join([header, sep] + rows)
+                    except Exception:
+                        answer_str = str(exec_res.df.head())
+
+                    valid_questions.append(q)
+                    valid_sqls.append(sql)
+                    valid_answers.append(answer_str)
+                else:
+                    if not exec_res.success:
+                        logger.debug("[golden-gen] Dropping query due to error: %s", exec_res.error)
+                    else:
+                        logger.debug("[golden-gen] Dropping query because it returned 0 rows.")
+
+            if not valid_questions:
+                logger.error(
+                    "[golden-gen] All generated golden queries were invalid or returned 0 rows for dataset %s",
+                    dataset_id[:8],
+                )
+                session_store.update_golden_ready(dataset_id, True)
+                return
+
+            # ── NL batch conversion ───────────────────────────────────────────────────
+            # Convert all markdown tables → natural language in ONE batched LLM call.
+            # Use a numbered format ("1. answer") which is trivial to parse reliably.
+            _NL_BATCH_SYSTEM = (
+                "You are a helpful data analyst. I will give you a numbered list of questions "
+                "and the data retrieved for each. Write a short, natural language answer for each. "
+                "Do NOT show the table or explain SQL. Reply with ONLY numbered answers, one per line:\n"
+                "1. [answer to question 1]\n2. [answer to question 2]\netc."
             )
-    except Exception as e:
-        logger.error("[golden-gen] NL batch generation failed: %s — keeping markdown", e)
+            nl_user_parts = []
+            for i, (q, a) in enumerate(zip(valid_questions, valid_answers), 1):
+                nl_user_parts.append(f"{i}. Question: {q}\nData:\n{a}")
+            nl_user_content = "\n\n".join(nl_user_parts)
 
-    embeddings = call_embedding(valid_questions)
-    if embeddings is None:
-        logger.error("[golden-gen] Embedding failed — cache not populated for dataset %s", dataset_id[:8])
-        return
+            try:
+                nl_raw = await call_llm(
+                    messages=[
+                        {"role": "system", "content": _NL_BATCH_SYSTEM},
+                        {"role": "user", "content": nl_user_content},
+                    ],
+                    step="nl-gen-batch",
+                    budget=budget,
+                    max_tokens=600,
+                    temperature=0.2,
+                    priority="background",
+                )
+                # Parse "1. answer", "2. answer" ... lines
+                nl_parsed = re.findall(r"^\d+\.\s+(.+)", nl_raw, re.MULTILINE)
+                if len(nl_parsed) == len(valid_answers):
+                    valid_answers = nl_parsed
+                    logger.info("[golden-gen] NL batch conversion OK (%d answers)", len(nl_parsed))
+                else:
+                    logger.warning(
+                        "[golden-gen] NL batch returned %d answers, expected %d — keeping markdown",
+                        len(nl_parsed), len(valid_answers),
+                    )
+            except Exception as e:
+                logger.error("[golden-gen] NL batch generation failed: %s — keeping markdown", e)
 
-    golden_cache.store_golden(dataset_id, valid_questions, valid_sqls, valid_answers, embeddings)
-    session_store.update_golden_ready(dataset_id, True)
-    logger.info("[golden-gen] %d valid golden queries stored for dataset %s", len(valid_questions), dataset_id[:8])
+            # ── Embed + store ─────────────────────────────────────────────────────────
+            embeddings = call_embedding(valid_questions)
+            if embeddings is None:
+                logger.error(
+                    "[golden-gen] Embedding failed — cache not populated for dataset %s",
+                    dataset_id[:8],
+                )
+                return
+
+            golden_cache.store_golden(dataset_id, valid_questions, valid_sqls, valid_answers, embeddings)
+            session_store.update_golden_ready(dataset_id, True)
+            logger.info(
+                "[golden-gen] %d valid golden queries stored for dataset %s",
+                len(valid_questions), dataset_id[:8],
+            )
+
+        except Exception as exc:
+            logger.error("[golden-gen] Total failure for dataset %s: %s", dataset_id[:8], exc)
+            _total_failure = True
+
+    # Retry logic OUTSIDE the semaphore so we don’t hold it during the 30s sleep.
+    if _total_failure:
+        if _attempt < 2:
+            logger.info(
+                "[golden-gen] Scheduling retry (attempt 2/2) in 30s for dataset %s",
+                dataset_id[:8],
+            )
+            import asyncio as _asyncio
+            await _asyncio.sleep(30)
+            _asyncio.create_task(
+                _generate_golden_bg(db_path, schema, dataset_id, _attempt=_attempt + 1)
+            )
+        else:
+            logger.error(
+                "[golden-gen] All 2 attempts failed for dataset %s — marking golden_ready=True with empty cache",
+                dataset_id[:8],
+            )
+            session_store.update_golden_ready(dataset_id, True)
 
 
 @router.post("/upload", response_model=UploadResponse)

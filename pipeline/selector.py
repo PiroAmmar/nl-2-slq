@@ -32,15 +32,18 @@ async def select_tables_and_fields(
     question: str,
     schema: dict[str, list[str]],
     budget: CallBudget,
+    priority: str = "interactive",
 ) -> tuple[str, dict[str, list[str]]]:
     """
     schema: {table_name: [col1, col2, ...]}
     Returns (status, filtered_subset). Falls back to ("ok", full schema) on parse error.
+
+    priority: passed through to each call_llm call ("interactive" or "background").
     """
     schema_text = _schema_to_text(schema)
     if len(schema_text) > _TWO_PASS_THRESHOLD:
-        return await _two_pass(question, schema, budget)
-    return await _one_pass(question, schema, schema_text, budget)
+        return await _two_pass(question, schema, budget, priority=priority)
+    return await _one_pass(question, schema, schema_text, budget, priority=priority)
 
 
 async def _one_pass(
@@ -48,6 +51,7 @@ async def _one_pass(
     schema: dict[str, list[str]],
     schema_text: str,
     budget: CallBudget,
+    priority: str = "interactive",
 ) -> tuple[str, dict[str, list[str]]]:
     raw = await call_llm(
         messages=[
@@ -61,6 +65,7 @@ async def _one_pass(
         budget=budget,
         max_tokens=512,
         temperature=0.0,
+        priority=priority,
     )
     return _parse_fields(raw, schema)
 
@@ -69,6 +74,7 @@ async def _two_pass(
     question: str,
     schema: dict[str, list[str]],
     budget: CallBudget,
+    priority: str = "interactive",
 ) -> tuple[str, dict[str, list[str]]]:
     # Pass 1: table names only
     table_list = "\n".join(f"- {t}" for t in schema)
@@ -84,6 +90,7 @@ async def _two_pass(
         budget=budget,
         max_tokens=256,
         temperature=0.0,
+        priority=priority,
     )
     try:
         selected = [t for t in json.loads(raw1).get("tables", []) if t in schema]
@@ -107,6 +114,7 @@ async def _two_pass(
         budget=budget,
         max_tokens=512,
         temperature=0.0,
+        priority=priority,
     )
     return _parse_fields(raw2, pruned)
 

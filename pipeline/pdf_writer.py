@@ -69,6 +69,7 @@ def write_qa_pdf(
 
     current_role = None
     current_section = None
+    is_first = True  # first item uses the page already added by pdf.add_page() above
 
     for item in successes:
         question = item["question"]
@@ -76,6 +77,14 @@ def write_qa_pdf(
         answer = item.get("answer", "")
         role = item.get("role", "")
         section = item.get("section", "")
+
+        # Force each Q&A block onto its own page.
+        # The very first item uses the page already opened above; all subsequent
+        # items get a fresh page so the PDF reader can navigate to any question
+        # by exact page number without risk of two questions sharing a page.
+        if not is_first:
+            pdf.add_page()
+        is_first = False
 
         # Print role/section headers when they change
         if role != current_role:
@@ -104,6 +113,18 @@ def write_qa_pdf(
         _write_sql_block(pdf, sql)
         _write_answer(pdf, answer)
         pdf.ln(_SECTION_GAP)
+
+        # ── overflow check ──────────────────────────────────────────────────
+        # fpdf2's auto-page-break means a very long block can overflow into
+        # additional pages even after our forced add_page(). Log a warning so
+        # operators can identify questions that need shorter answers.
+        end_page = pdf.page_no()
+        if end_page - start_page > 1:
+            logger.warning(
+                "[pdf] Question overflowed onto %d pages: %s",
+                end_page - start_page + 1,
+                question[:60],
+            )
 
     pdf.output(output_path)
     logger.info("PDF written to %s (%d Q&A blocks)", output_path, len(successes))

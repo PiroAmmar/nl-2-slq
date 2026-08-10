@@ -50,11 +50,16 @@ async def execute_and_verify(
     budget: CallBudget,
     # Pass generator coroutine function to avoid circular import
     generate_sql_fn,  # async Callable
+    priority: str = "interactive",
 ) -> ExecutionResult:
     """
     Full execution + verification loop.
     Returns ExecutionResult with .success=True on verified success,
     or .success=False with .error describing what went wrong.
+
+    priority: forwarded as a kwarg to generate_sql_fn on each SQL regeneration
+    attempt, so retry-path calls inherit the correct priority tier
+    ("interactive" for user queries, "background" for batch ingestion).
     """
     sql = initial_sql
     exec_attempts = 0
@@ -88,6 +93,7 @@ async def execute_and_verify(
                 budget=budget,
                 prior_sql=sql,
                 error_message=result.error,
+                priority=priority,
             )
             continue
 
@@ -163,6 +169,3 @@ def _classify_error(err: str) -> str:
     if "permission" in err_lower or "readonly" in err_lower or "read-only" in err_lower:
         return "permission"
     return "unknown"
-
-
-

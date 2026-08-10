@@ -30,6 +30,7 @@ from pipeline.doc_ingestor import parse_questions, run_batch
 from pipeline.pdf_writer import write_qa_pdf
 from pipeline.embedding import call_embedding
 from pipeline import cache as golden_cache
+from pipeline.llm import BACKGROUND_JOB_SEMAPHORE
 
 logger = logging.getLogger(__name__)
 
@@ -62,73 +63,85 @@ async def ingest(
     os.makedirs(_OUTPUT_DIR, exist_ok=True)
     os.makedirs(_INPUT_DIR, exist_ok=True)   # create if missing — no manual setup needed
 
-    # ── Step 1: Parse ─────────────────────────────────────────────────────────
-    logger.info("[doc_qa] Parsing questions from %s", docx_path)
-    questions = parse_questions(docx_path)
-    if not questions:
-        logger.warning("[doc_qa] No questions found in %s", docx_path)
-        return {"total": 0, "success_count": 0, "failure_count": 0, "pdf_path": None, "failures": []}
+    # Acquire the process-wide background-job semaphore. This ensures only
+    # GOLDEN_GEN_MAX_CONCURRENT (default: 1) doc-ingest or golden-gen jobs
+    # run at a time, preventing uncontrolled concurrency against Groq's RPM.
+    # The semaphore is released as soon as ingest() exits (normally or on error).
+    async with BACKGROUND_JOB_SEMAPHORE:
+        # Re-check cancellation immediately after acquiring — the server may have
+        # shut down while we were waiting for the semaphore.
+        if cancel_event is not None and cancel_event.is_set():
+            logger.warning("[doc_qa] Job cancelled while waiting for semaphore — aborting.")
+            return {"total": 0, "success_count": 0, "failure_count": 0, "pdf_path": None, "failures": []}
+
+        # ── Step 1: Parse ─────────────────────────────────────────────────────────
+        logger.info("[doc_qa] Parsing questions from %s", docx_path)
+        questions = parse_questions(docx_path)
+        if not questions:
+            logger.warning("[doc_qa] No questions found in %s", docx_path)
+            return {"total": 0, "success_count": 0, "failure_count": 0, "pdf_path": None, "failures": []}
 
 
-    # ── Step 2: Batch run pipeline ────────────────────────────────────────────
-    logger.info("[doc_qa] Running %d questions through pipeline", len(questions))
-    successes, failures = await run_batch(
-        questions=questions,
-        db_path=db_path,
-        schema=schema,
-        dataset_hash=dataset_hash,
-        budget_per_q=_BUDGET_PER_Q,
-        cancel_event=cancel_event,
-    )
+        # ── Step 2: Batch run pipeline ────────────────────────────────────────────
+        logger.info("[doc_qa] Running %d questions through pipeline", len(questions))
+        successes, failures = await run_batch(
+            questions=questions,
+            db_path=db_path,
+            schema=schema,
+            dataset_hash=dataset_hash,
+            budget_per_q=_BUDGET_PER_Q,
+            cancel_event=cancel_event,
+            priority="background",
+        )
 
-    # ── Step 3: PDF generation ────────────────────────────────────────────────
-    pdf_path = None
-    page_meta: list[dict] = []
+        # ── Step 3: PDF generation ────────────────────────────────────────────────
+        pdf_path = None
+        page_meta: list[dict] = []
 
-    if successes:
-        doc_stem = os.path.splitext(os.path.basename(docx_path))[0]
-        # Deterministic filename keyed by content + dataset
-        doc_hash = hashlib.sha256(doc_stem.encode()).hexdigest()[:8]
-        pdf_filename = f"{doc_stem}_{dataset_hash[:8]}_{doc_hash}.pdf"
-        pdf_path = os.path.join(_OUTPUT_DIR, pdf_filename)
+        if successes:
+            doc_stem = os.path.splitext(os.path.basename(docx_path))[0]
+            # Deterministic filename keyed by content + dataset
+            doc_hash = hashlib.sha256(doc_stem.encode()).hexdigest()[:8]
+            pdf_filename = f"{doc_stem}_{dataset_hash[:8]}_{doc_hash}.pdf"
+            pdf_path = os.path.join(_OUTPUT_DIR, pdf_filename)
 
-        logger.info("[doc_qa] Writing PDF to %s", pdf_path)
-        page_meta = write_qa_pdf(successes, pdf_path)
-    else:
-        logger.warning("[doc_qa] No successful answers — skipping PDF generation")
-
-    # ── Step 4: Embed + store in ChromaDB ────────────────────────────────────
-    if successes and page_meta:
-        questions_text = [s["question"] for s in successes]
-        sqls = [s["sql"] for s in successes]
-        answers = [s["answer"] for s in successes]
-
-        logger.info("[doc_qa] Embedding %d successful answers", len(questions_text))
-        embeddings = call_embedding(questions_text)
-
-        if embeddings is None:
-            logger.error("[doc_qa] Embedding failed — doc_qa entries NOT stored in cache")
+            logger.info("[doc_qa] Writing PDF to %s", pdf_path)
+            page_meta = write_qa_pdf(successes, pdf_path)
         else:
-            golden_cache.store_doc_qa(
-                dataset_hash=dataset_hash,
-                questions=questions_text,
-                sqls=sqls,
-                answers=answers,
-                embeddings=embeddings,
-                page_meta=page_meta,
-            )
-            logger.info("[doc_qa] Stored %d doc_qa entries in ChromaDB", len(questions_text))
+            logger.warning("[doc_qa] No successful answers — skipping PDF generation")
 
-    # ── Step 5: Summary ───────────────────────────────────────────────────────
-    summary = {
-        "total": len(questions),
-        "success_count": len(successes),
-        "failure_count": len(failures),
-        "pdf_path": pdf_path,
-        "failures": failures,
-    }
-    _log_summary(summary)
-    return summary
+        # ── Step 4: Embed + store in ChromaDB ────────────────────────────────────
+        if successes and page_meta:
+            questions_text = [s["question"] for s in successes]
+            sqls = [s["sql"] for s in successes]
+            answers = [s["answer"] for s in successes]
+
+            logger.info("[doc_qa] Embedding %d successful answers", len(questions_text))
+            embeddings = call_embedding(questions_text)
+
+            if embeddings is None:
+                logger.error("[doc_qa] Embedding failed — doc_qa entries NOT stored in cache")
+            else:
+                golden_cache.store_doc_qa(
+                    dataset_hash=dataset_hash,
+                    questions=questions_text,
+                    sqls=sqls,
+                    answers=answers,
+                    embeddings=embeddings,
+                    page_meta=page_meta,
+                )
+                logger.info("[doc_qa] Stored %d doc_qa entries in ChromaDB", len(questions_text))
+
+        # ── Step 5: Summary ───────────────────────────────────────────────────────
+        summary = {
+            "total": len(questions),
+            "success_count": len(successes),
+            "failure_count": len(failures),
+            "pdf_path": pdf_path,
+            "failures": failures,
+        }
+        _log_summary(summary)
+        return summary
 
 
 def _log_summary(summary: dict) -> None:

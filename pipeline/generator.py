@@ -86,6 +86,7 @@ async def generate_sql(
     prior_sql: str | None = None,
     error_message: str | None = None,
     verifier_reasoning: str | None = None,
+    priority: str = "interactive",
 ) -> str:
     """
     Generate (or correct) a SQL query.
@@ -93,6 +94,8 @@ async def generate_sql(
     When prior_sql + error_message are provided: correction mode (retry loop).
     When prior_sql + verifier_reasoning are provided: regeneration mode.
     Returns cleaned SQL string.
+
+    priority: passed through to call_llm ("interactive" or "background").
     """
     schema_text = _schema_to_text(selected_schema)
 
@@ -136,6 +139,7 @@ async def generate_sql(
         budget=budget,
         max_tokens=512,
         temperature=0.1,
+        priority=priority,
     )
 
     return _clean_sql(raw)

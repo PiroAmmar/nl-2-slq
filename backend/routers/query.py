@@ -59,7 +59,8 @@ Respond strictly with YES or NO."""
                     step="cache-validate",
                     budget=budget,
                     max_tokens=10,
-                    temperature=0.0
+                    temperature=0.0,
+                    priority="interactive",
                 )
             except Exception as exc:
                 logger.warning("Cache validation failed: %s", exc)
@@ -93,7 +94,7 @@ Respond strictly with YES or NO."""
 
     # ── Step 1/2: Triage + Selection ───────────────────────────────────────────
     try:
-        status, selected_schema = await select_tables_and_fields(question, schema, budget)
+        status, selected_schema = await select_tables_and_fields(question, schema, budget, priority="interactive")
         if status != "ok":
             return QueryResponse(
                 answer=f"This question appears to be {status}. I can only answer questions related to the dataset.",
@@ -104,7 +105,7 @@ Respond strictly with YES or NO."""
 
     # ── Step 3: SQL generation ─────────────────────────────────────────────────
     try:
-        sql = await generate_sql(question, selected_schema, budget)
+        sql = await generate_sql(question, selected_schema, budget, priority="interactive")
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -120,6 +121,7 @@ Respond strictly with YES or NO."""
             db_path=db_path,
             budget=budget,
             generate_sql_fn=_gen_fn,
+            priority="interactive",
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -132,7 +134,7 @@ Respond strictly with YES or NO."""
 
     # ── Step 5: NL response + chart ────────────────────────────────────────────
     try:
-        nl_answer, fig, is_real_answer = await generate_response(question, result, budget)
+        nl_answer, fig, is_real_answer = await generate_response(question, result, budget, priority="interactive")
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

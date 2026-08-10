@@ -53,14 +53,17 @@ async def generate_response(
     question: str,
     result: ExecutionResult,
     budget: CallBudget,
+    priority: str = "interactive",
 ) -> tuple[str, go.Figure | None, bool]:
     """
     Returns (nl_answer, plotly_figure_or_None, is_real_answer).
     figure is None when chart_type is table_only or chart build fails.
     is_real_answer is False when the LLM call failed and a generic
     placeholder was returned instead — callers should NOT cache that.
+
+    priority: passed through to call_llm ("interactive" or "background").
     """
-    nl_answer, is_real_answer = await _generate_answer(question, result, budget)
+    nl_answer, is_real_answer = await _generate_answer(question, result, budget, priority=priority)
     fig = None
 
     if result.df is not None and not result.df.empty:
@@ -77,6 +80,7 @@ async def _generate_answer(
     question: str,
     result: ExecutionResult,
     budget: CallBudget,
+    priority: str = "interactive",
 ) -> tuple[str, bool]:
     if result.df is None or result.df.empty:
         preview = "Empty result set — no matching rows were found."
@@ -100,6 +104,7 @@ async def _generate_answer(
             budget=budget,
             max_tokens=700,
             temperature=0.0,
+            priority=priority,
         )
         final_text = draft
         # Strip markdown fences if LLM wrapped the JSON

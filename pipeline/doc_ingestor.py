@@ -116,6 +116,7 @@ async def run_batch(
     dataset_hash: str,
     budget_per_q: int = 15,
     cancel_event: asyncio.Event | None = None,
+    priority: str = "background",
 ) -> tuple[list[dict], list[dict]]:
     """
     Run every question through the full pipeline (Steps 1-5), concurrently
@@ -164,7 +165,7 @@ async def run_batch(
 
             logger.info("[batch %d/%d] Running: %s", idx + 1, total, q[:80])
             try:
-                result_entry = await _run_single(q, db_path, schema, dataset_hash, budget_per_q)
+                result_entry = await _run_single(q, db_path, schema, dataset_hash, budget_per_q, priority=priority)
                 if result_entry is None:
                     results[idx] = {
                         "kind": "failure",
@@ -216,20 +217,24 @@ async def _run_single(
     schema: dict,
     dataset_hash: str,
     budget_per_q: int,
+    priority: str = "background",
 ) -> dict | None:
     """Run one question through Steps 1–5. Returns result dict or None."""
     budget = CallBudget(max_calls=budget_per_q)
 
     # Step 1/2: Triage + Table/field selection
-    status, selected_schema = await select_tables_and_fields(question, schema, budget)
+    status, selected_schema = await select_tables_and_fields(question, schema, budget, priority=priority)
     if status != "ok":
         logger.info("[batch] Skipped (triage=%s): %s", status, question[:60])
         return None
 
     # Step 3: Initial SQL generation
-    sql = await generate_sql(question, selected_schema, budget)
+    sql = await generate_sql(question, selected_schema, budget, priority=priority)
 
     # Step 4: Execution + verification
+    # _gen_fn is a simple pass-through: execute_and_verify forwards
+    # priority=priority as a kwarg, which lands in **kwargs and is passed
+    # directly to generate_sql (which now accepts it as a keyword argument).
     async def _gen_fn(**kwargs):
         return await generate_sql(**kwargs)
 
@@ -240,6 +245,7 @@ async def _run_single(
         db_path=db_path,
         budget=budget,
         generate_sql_fn=_gen_fn,
+        priority=priority,
     )
 
     if not result.success:
@@ -248,7 +254,7 @@ async def _run_single(
         )
 
     # Step 5: Response generation
-    nl_answer, _fig, is_real_answer = await generate_response(question, result, budget)
+    nl_answer, _fig, is_real_answer = await generate_response(question, result, budget, priority=priority)
 
     return {
         "sql": result.sql,
