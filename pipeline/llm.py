@@ -21,7 +21,7 @@ from groq import AsyncGroq
 
 logger = logging.getLogger(__name__)
 
-GROQ_MODEL = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL_NAME", "openai/gpt-oss-120b")
 
 # Groq free/dev tier is commonly RPM-limited well below what a naive loop
 # sends. Override via env for paid tiers. This is a *ceiling*, not a target —
@@ -121,15 +121,20 @@ async def call_llm(
     while attempt <= max_retries:
         await _rate_limiter.acquire()
         try:
-            completion = await client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                max_completion_tokens=max_tokens,
-                top_p=0.95,
-                stream=False,
-                stop=None,
-            )
+            # We pass reasoning_effort if the model supports it. 
+            params = {
+                "model": GROQ_MODEL,
+                "messages": messages,  # type: ignore[arg-type]
+                "temperature": temperature,
+                "max_completion_tokens": max_tokens,
+                "top_p": 0.85,
+                "stream": False,
+                "stop": None,
+            }
+            # Groq supports `reasoning_effort` for its own models only.
+            if not GROQ_MODEL.startswith("openai/"):
+                params["reasoning_effort"] = "low"
+            completion = await client.chat.completions.create(**params)
             text = (completion.choices[0].message.content or "").strip()
             logger.info("[%s] Groq call #%d OK (%d chars)", step, budget.used, len(text))
             return text

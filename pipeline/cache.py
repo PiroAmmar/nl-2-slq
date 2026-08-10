@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 _CHROMA_DIR = os.path.join(os.path.dirname(__file__), "..", "chroma_store")
 _client: chromadb.ClientAPI | None = None
 
-SIMILARITY_THRESHOLD = 0.88  # cosine similarity — tune empirically
+SIMILARITY_THRESHOLD = 0.85  # cosine similarity — tune empirically
 
 
 def _get_chroma() -> chromadb.ClientAPI:

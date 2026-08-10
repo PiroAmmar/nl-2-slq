@@ -20,28 +20,41 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File
 from backend.schemas import DatasetStatusResponse, UploadResponse
 from backend import session_store
 from pipeline import cache as golden_cache
+from pipeline.executor import _run_sql
 from pipeline.embedding import call_embedding
 from pipeline.llm import CallBudget, call_llm
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
-_GOLDEN_QUERY_COUNT = 10
-_GOLDEN_SYSTEM = """You are a SQL expert. Generate {n} diverse golden SQL queries
+_GOLDEN_QUERY_COUNT = 6  # Keep small: each query = 2 LLM calls (SQL + NL)
+_GOLDEN_SYSTEM = """
+You are a SQL expert. Generate {n} diverse golden SQL queries
 for the following database schema. Cover: simple lookups, aggregations, filters,
 group-bys, ordering, and edge cases (empty results, max/min, counts).
 
-CRITICAL SQL RULES:
+CRITICAL SQL RULES (USE SQLITE SYNTAX STRICTLY):
 - ALWAYS wrap text column comparisons in LOWER(): LOWER(col) = LOWER('value')
 - NEVER use bare equality for string filters: Channel = 'retail' -> LOWER(Channel) = 'retail'
 - For LIKE patterns, use: LOWER(col) LIKE LOWER('%pattern%')
 - Always add IS NOT NULL filters for aggregation columns.
+- DO NOT use PostgreSQL `DATE 'YYYY-MM-DD'` syntax. Use standard strings: `col >= '2023-03-01'`.
+- DO NOT use `FETCH FIRST`. Use `LIMIT n` to limit rows.
 
 Schema:
 {schema}
 
-Reply with ONLY valid JSON (no markdown):
-{{"golden_queries": [{{"question": "...", "sql": "...", "answer": "..."}}]}}"""
+Reply using EXACTLY this plain-text delimited format. Do NOT use JSON. Do not include extra text.
+===
+Q: [Your first question here]
+SQL: [Your first SQL query here]
+===
+Q: [Your second question here]
+SQL: [Your second SQL query here]
+===
+"""
+
+
 
 
 def _get_schema(db_path: str) -> dict[str, list[str]]:
@@ -57,39 +70,148 @@ def _get_schema(db_path: str) -> dict[str, list[str]]:
     return schema
 
 
-def _schema_to_text(schema: dict) -> str:
-    return "\n".join(f"{t}({', '.join(cols)})" for t, cols in schema.items())
+_MAX_COLS_PER_TABLE = 25  # Avoid flooding the prompt for very wide tables
+_SAMPLE_VALUES = 2        # Distinct values per column shown in schema
+_SAMPLE_MAX_LEN = 20      # Truncate long sample values
+
+
+def _get_schema_with_samples(db_path: str, schema: dict[str, list[str]]) -> str:
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    lines = []
+    for table, cols in schema.items():
+        lines.append(f"Table: {table}")
+        shown_cols = cols[:_MAX_COLS_PER_TABLE]
+        if len(cols) > _MAX_COLS_PER_TABLE:
+            lines.append(f"  ... ({len(cols) - _MAX_COLS_PER_TABLE} more columns omitted)")
+        for col in shown_cols:
+            try:
+                cursor.execute(f'SELECT DISTINCT "{col}" FROM "{table}" WHERE "{col}" IS NOT NULL LIMIT {_SAMPLE_VALUES};')
+                vals = [str(r[0])[:_SAMPLE_MAX_LEN] for r in cursor.fetchall()]
+                sample_str = f" (e.g. {', '.join(vals)})" if vals else ""
+            except Exception:
+                sample_str = ""
+            lines.append(f"  - {col}{sample_str}")
+    conn.close()
+    return "\n".join(lines)
 
 
 async def _generate_golden_bg(db_path: str, schema: dict, dataset_id: str) -> None:
     """Background task: generate + store golden queries, then mark golden_ready."""
     budget = CallBudget(max_calls=2)
-    schema_text = _schema_to_text(schema)
+    schema_text = _get_schema_with_samples(db_path, schema)
     try:
         raw = await call_llm(
             messages=[{"role": "user", "content": _GOLDEN_SYSTEM.format(n=_GOLDEN_QUERY_COUNT, schema=schema_text)}],
             step="golden-gen",
             budget=budget,
-            max_tokens=2048,
+            max_tokens=1200,
             temperature=0.3,
         )
-        gqs = json.loads(raw).get("golden_queries", [])
+        gqs = []
+        import re
+        blocks = raw.split("===")
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+            match = re.search(r"Q:\s*(.*?)\nSQL:\s*(.*)", block, re.DOTALL | re.IGNORECASE)
+            if match:
+                gqs.append({
+                    "question": match.group(1).strip(),
+                    "sql": match.group(2).strip()
+                })
+                
+        if not gqs:
+            logger.error("[golden-gen] Failed to parse delimited output for dataset %s. Raw: %s", dataset_id[:8], raw[:200])
     except Exception as exc:
         logger.error("[golden-gen] Failed for dataset %s: %s", dataset_id[:8], exc)
         return
 
-    questions = [g["question"] for g in gqs]
-    sqls = [g["sql"] for g in gqs]
-    answers = [g["answer"] for g in gqs]
+    valid_questions = []
+    valid_sqls = []
+    valid_answers = []
 
-    embeddings = call_embedding(questions)
+    for g in gqs:
+        if not isinstance(g, dict) or "question" not in g or "sql" not in g:
+            continue
+        q = g["question"]
+        sql = g["sql"]
+        exec_res = _run_sql(sql, db_path)
+        
+        if exec_res.success and not exec_res.df.empty:
+            try:
+                # Format dataframe as a readable Markdown table
+                df_head = exec_res.df.head()
+                header = "| " + " | ".join(str(c) for c in df_head.columns) + " |"
+                sep = "|" + "|".join(["---"] * len(df_head.columns)) + "|"
+                rows = []
+                for _, row in df_head.iterrows():
+                    rows.append("| " + " | ".join(str(v) for v in row.values) + " |")
+                answer_str = "\n".join([header, sep] + rows)
+            except Exception:
+                answer_str = str(exec_res.df.head())
+                
+            valid_questions.append(q)
+            valid_sqls.append(sql)
+            valid_answers.append(answer_str)
+        else:
+            if not exec_res.success:
+                logger.debug("[golden-gen] Dropping query due to error: %s", exec_res.error)
+            else:
+                logger.debug("[golden-gen] Dropping query because it returned 0 rows.")
+
+    if not valid_questions:
+        logger.error("[golden-gen] All generated golden queries were invalid or returned 0 rows for dataset %s", dataset_id[:8])
+        session_store.update_golden_ready(dataset_id, True)
+        return
+
+    # Convert all markdown tables → natural language in ONE batched LLM call.
+    # Use a numbered format ("1. answer") which is trivial to parse reliably.
+    _NL_BATCH_SYSTEM = (
+        "You are a helpful data analyst. I will give you a numbered list of questions "
+        "and the data retrieved for each. Write a short, natural language answer for each. "
+        "Do NOT show the table or explain SQL. Reply with ONLY numbered answers, one per line:\n"
+        "1. [answer to question 1]\n2. [answer to question 2]\netc."
+    )
+    nl_user_parts = []
+    for i, (q, a) in enumerate(zip(valid_questions, valid_answers), 1):
+        nl_user_parts.append(f"{i}. Question: {q}\nData:\n{a}")
+    nl_user_content = "\n\n".join(nl_user_parts)
+
+    try:
+        import re
+        nl_raw = await call_llm(
+            messages=[
+                {"role": "system", "content": _NL_BATCH_SYSTEM},
+                {"role": "user", "content": nl_user_content},
+            ],
+            step="nl-gen-batch",
+            budget=budget,
+            max_tokens=600,
+            temperature=0.2,
+        )
+        # Parse "1. answer", "2. answer" ... lines
+        nl_parsed = re.findall(r"^\d+\.\s+(.+)", nl_raw, re.MULTILINE)
+        if len(nl_parsed) == len(valid_answers):
+            valid_answers = nl_parsed
+            logger.info("[golden-gen] NL batch conversion OK (%d answers)", len(nl_parsed))
+        else:
+            logger.warning(
+                "[golden-gen] NL batch returned %d answers, expected %d — keeping markdown",
+                len(nl_parsed), len(valid_answers)
+            )
+    except Exception as e:
+        logger.error("[golden-gen] NL batch generation failed: %s — keeping markdown", e)
+
+    embeddings = call_embedding(valid_questions)
     if embeddings is None:
         logger.error("[golden-gen] Embedding failed — cache not populated for dataset %s", dataset_id[:8])
         return
 
-    golden_cache.store_golden(dataset_id, questions, sqls, answers, embeddings)
+    golden_cache.store_golden(dataset_id, valid_questions, valid_sqls, valid_answers, embeddings)
     session_store.update_golden_ready(dataset_id, True)
-    logger.info("[golden-gen] %d golden queries stored for dataset %s", len(gqs), dataset_id[:8])
+    logger.info("[golden-gen] %d valid golden queries stored for dataset %s", len(valid_questions), dataset_id[:8])
 
 
 @router.post("/upload", response_model=UploadResponse)

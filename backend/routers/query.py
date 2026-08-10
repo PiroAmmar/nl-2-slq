@@ -45,15 +45,50 @@ async def ask_question(req: QueryRequest) -> QueryResponse:
     if question_embedding is not None:
         hit = golden_cache.lookup(dataset_hash, question_embedding[0])
         if hit:
-            return QueryResponse(
-                answer=hit["answer"],
-                sql=hit["sql"],
-                cache_hit=True,
-                similarity=hit["similarity"],
-                source_type=hit.get("source_type"),
-                source_pdf=hit.get("source_pdf"),
-                source_page=hit.get("source_page"),
-            )
+            # ── LLM semantic validation ──
+            from pipeline.llm import call_llm
+            validation_prompt = f"""You are an AI validating semantic cache hits for a text-to-SQL system. 
+Are these two questions asking for the exact same data?
+Question 1: {question}
+Question 2: {hit['question']}
+Respond strictly with YES or NO."""
+            
+            try:
+                val_res = await call_llm(
+                    messages=[{"role": "system", "content": validation_prompt}],
+                    step="cache-validate",
+                    budget=budget,
+                    max_tokens=10,
+                    temperature=0.0
+                )
+            except Exception as exc:
+                logger.warning("Cache validation failed: %s", exc)
+                val_res = "NO"
+
+            if "YES" in val_res.upper():
+                # Execute the cached SQL against the live DB to get real rows.
+                # The stored "answer" is just an LLM-written description — we want actual data.
+                import asyncio
+                from pipeline.executor import _run_sql, ExecutionResult
+    
+                cached_sql = hit["sql"]
+                exec_result: ExecutionResult = await asyncio.to_thread(_run_sql, cached_sql, db_path)
+    
+                if exec_result.success:
+                    chart_json: str | None = None
+                    return QueryResponse(
+                        answer=hit["answer"],   # description from cache
+                        sql=exec_result.sql,
+                        chart_json=chart_json,
+                        row_count=exec_result.row_count,
+                        cache_hit=True,
+                        similarity=hit["similarity"],
+                        source_type=hit.get("source_type"),
+                        source_pdf=hit.get("source_pdf"),
+                        source_page=hit.get("source_page"),
+                        llm_calls_used=0,
+                    )
+                # SQL failed (schema change etc.) — fall through to full pipeline
 
 
     # ── Step 1/2: Triage + Selection ───────────────────────────────────────────
