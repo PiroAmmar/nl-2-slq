@@ -145,9 +145,42 @@ warning every run (removed after 2025-12-31).
 ---
 
 ## 21. Hardcoded absolute Windows path for sql-guide skill
-**Known issue (not yet fixed):** `generator.py` loads
-`C:\Users\Syed Ammar Ali\.gemini\config\skills\sql-guide\SKILL.md` — works locally but silently
-falls back to `_SQL_GUIDE = ""` (with only a log warning) on any other machine, CI runner, or
-deployment target. Should be replaced with an env var (e.g. `SQL_GUIDE_PATH`) with the current
-path as a default, or a path relative to the repo.
+**Bug:** `generator.py` loaded `C:\Users\Syed Ammar Ali\.gemini\config\skills\sql-guide\SKILL.md` directly.
+**Fix:** Changed to use `os.getenv("SQL_GUIDE_PATH")`.
+
+---
+
+## 22. Temp File Leak from File Uploads
+**Bug:** `app.py` used `tempfile.NamedTemporaryFile(delete=False)` to save uploaded SQLite DBs but never cleaned them up when a new dataset was uploaded, leaving stale `.db` files on disk.
+**Fix:** Added cleanup logic to `app.py` to `os.remove(st.session_state.db_path)` when a new file is uploaded.
+
+---
+
+## 23. Pandas DatabaseError Swallowing
+**Bug:** `pd.read_sql_query` wrapped `sqlite3.OperationalError` into `pandas.errors.DatabaseError`. The `except sqlite3.OperationalError` block in `executor.py` missed this, causing schema errors to fall through to a generic `Exception` catch-all labeled as `"unknown"`. This prevented the LLM's auto-correction loop from seeing the actual schema error text.
+**Fix:** Replaced the specific exception catch with a generic `Exception` block that stringifies and categorizes the error (e.g., checking if "no such table" is in the string).
+
+---
+
+## 24. Unsupported Groq API Parameter
+**Bug:** The `reasoning_effort="low"` parameter was hardcoded in `llm.py`. This is only supported by reasoning models, causing a `400 Bad Request` when switching to standard Llama models.
+**Fix:** Removed the `reasoning_effort` parameter from the `call_llm` request.
+
+---
+
+## 25. Hardcoded Groq Model Name
+**Bug:** The model `openai/gpt-oss-120b` was hardcoded in `llm.py` instead of being configurable.
+**Fix:** Updated `llm.py` to use `os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")` and added `GROQ_MODEL_NAME` to `.env`.
+
+---
+
+## 26. Unnecessary Default Boilerplate Database
+**Bug:** `students.db` was loaded as a `DEFAULT_DB` in `app.py`, acting as unnecessary boilerplate and causing irrelevant context when no file was uploaded.
+**Fix:** Removed `DEFAULT_DB` logic, starting the app in a truly empty state, and added a UI check to prompt for a file upload before allowing queries.
+
+---
+
+## 27. Date and String JOIN Mismatches (Actual Sales = 0)
+**Bug:** When the LLM generated JOINs between tables, it sometimes compared full dates (`'2025-01-01'`) with formatted month strings (`'2025-01'`), or mismatched territory string cases, leading to silent empty result sets.
+**Fix:** Updated the generator prompt rules in `generator.py` to explicitly require `strftime` normalization on *both* sides of date JOINs and `LOWER()` on string JOIN conditions.
 

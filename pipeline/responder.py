@@ -13,52 +13,57 @@ import logging
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
 
 from pipeline.executor import ExecutionResult
 from pipeline.llm import CallBudget, call_llm
 
 logger = logging.getLogger(__name__)
 
-_ANSWER_SYSTEM = """You are a skilled data analyst writing a report for a business user.
-Given a user question and query results, produce a rich, well-structured markdown response:
+_ANSWER_SYSTEM = """You are a Business Intelligence analyst.
+The SQL result is the ONLY source of truth.
+Only draw conclusions directly supported by the SQL result.
+Never explain WHY something happened unless the data explicitly proves it.
+Never infer customer demand, marketing effectiveness, pricing strategy, product quality, market leadership, competitive advantage, or operational efficiency.
+Use phrases like 'The data shows...' and 'Additional analysis would be required.'
+If the data cannot answer the question, return confidence "REJECTED".
 
-- Start with a short summary paragraph (2-3 sentences) highlighting the most important finding.
-- Use **bold** for key numbers, dates, and entity names.
-- If there are trends or notable patterns, describe them in a second paragraph.
-- End with a concise bullet-point breakdown of key data points (max 8 bullets).
-- Do NOT show raw SQL. Do NOT use code blocks.
-- If the result set is empty, clearly explain no matching data was found and suggest why.
-- Use PKR, %, or other units present in the data naturally in your text."""
-
-_CHART_SYSTEM = """You are a data visualisation expert.
-Given column names, dtypes, row count, and a small data sample, choose the
-best chart type. Reply with ONLY valid JSON (no markdown):
+Structure your response EXACTLY as valid JSON matching this schema (do NOT use markdown blocks):
 {
-  "chart_type": "bar" | "h_bar" | "line" | "multi_line" | "scatter" | "pie" | "heatmap" | "table_only",
-  "x": "column_name_or_null",
-  "y": "column_name_or_null",
-  "color": "column_name_or_null",
-  "reasoning": "one sentence"
-}"""
+  "query_type": "lookup" | "ranking" | "comparison" | "trend" | "distribution" | "time_series" | "exploratory",
+  "answer": {
+    "title": "Short descriptive title (e.g. 'Highest Unit Price')",
+    "value": "The primary answer (e.g. 'BrightWash')"
+  },
+  "evidence": [
+    {"label": "Metric name", "value": "Metric value"}
+  ],
+  "confidence": "SUPPORTED" | "REJECTED",
+  "limitations": "Optional string describing what the data cannot tell us"
+}
+"""
+
+
 
 LARGE_RESULT_THRESHOLD = 5_000  # rows above which scatter/line gets down-sampled
 
 
 # ── public entry point ────────────────────────────────────────────────────────
 
-def generate_response(
+async def generate_response(
     question: str,
     result: ExecutionResult,
     budget: CallBudget,
+    priority: str = "interactive",
 ) -> tuple[str, go.Figure | None, bool]:
     """
     Returns (nl_answer, plotly_figure_or_None, is_real_answer).
     figure is None when chart_type is table_only or chart build fails.
     is_real_answer is False when the LLM call failed and a generic
     placeholder was returned instead — callers should NOT cache that.
+
+    priority: passed through to call_llm ("interactive" or "background").
     """
-    nl_answer, is_real_answer = _generate_answer(question, result, budget)
+    nl_answer, is_real_answer = await _generate_answer(question, result, budget, priority=priority)
     fig = None
 
     if result.df is not None and not result.df.empty:
@@ -71,10 +76,11 @@ def generate_response(
 
 # ── NL answer ─────────────────────────────────────────────────────────────────
 
-def _generate_answer(
+async def _generate_answer(
     question: str,
     result: ExecutionResult,
     budget: CallBudget,
+    priority: str = "interactive",
 ) -> tuple[str, bool]:
     if result.df is None or result.df.empty:
         preview = "Empty result set — no matching rows were found."
@@ -83,24 +89,43 @@ def _generate_answer(
 
     user_content = (
         f"Question: {question}\n\n"
+        f"SQL:\n{result.sql}\n\n"
+        f"Columns and dtypes: {json.dumps(result.col_metadata)}\n\n"
         f"Row count: {result.row_count}\n"
         f"Result preview:\n{preview}"
     )
     try:
-        text = call_llm(
+        draft = await call_llm(
             messages=[
                 {"role": "system", "content": _ANSWER_SYSTEM},
                 {"role": "user", "content": user_content},
             ],
             step="responder",
             budget=budget,
-            max_tokens=512,
-            temperature=0.3,
+            max_tokens=700,
+            temperature=0.0,
+            priority=priority,
         )
-        return text, True
+        final_text = draft
+        # Strip markdown fences if LLM wrapped the JSON
+        final_text = final_text.strip()
+        import re
+        final_text = re.sub(r"^```(?:json)?\s*", "", final_text, flags=re.IGNORECASE)
+        final_text = re.sub(r"\s*```$", "", final_text)
+        
+        # Verify JSON
+        json.loads(final_text)
+        
+        return final_text, True
     except Exception as exc:
         logger.warning("Answer generation failed: %s — using fallback (not cached).", exc)
-        return f"Retrieved {result.row_count} row(s). See the table below for details.", False
+        fallback = {
+            "query_type": "exploratory",
+            "answer": {"title": "Result", "value": f"Retrieved {result.row_count} row(s)."},
+            "evidence": [],
+            "confidence": "SUPPORTED"
+        }
+        return json.dumps(fallback), False
 
 
 # ── chart type selection ──────────────────────────────────────────────────────
@@ -117,8 +142,8 @@ def _select_chart_type(
     decision = _rule_based(df)
     if decision is not None:
         return decision
-    # Fallback to LLM
-    return _llm_chart_decision(df, question, budget)
+    # Fallback to table_only if rules fail
+    return {"chart_type": "table_only", "x": None, "y": None, "color": None}
 
 
 def _rule_based(df: pd.DataFrame) -> dict | None:
@@ -176,37 +201,6 @@ def _looks_like_date(series: pd.Series) -> bool:
         return False
 
 
-def _llm_chart_decision(df: pd.DataFrame, question: str, budget: CallBudget) -> dict:
-    """LLM fallback for ambiguous shapes. Returns safe default on failure."""
-    col_info = {c: str(df[c].dtype) for c in df.columns}
-    sample = df.head(5).to_dict(orient="list")
-    user_content = (
-        f"Question: {question}\n"
-        f"Row count: {len(df)}\n"
-        f"Columns and dtypes: {json.dumps(col_info)}\n"
-        f"Data sample: {json.dumps(sample, default=str)}"
-    )
-    try:
-        raw = call_llm(
-            messages=[
-                {"role": "system", "content": _CHART_SYSTEM},
-                {"role": "user", "content": user_content},
-            ],
-            step="chart-selector",
-            budget=budget,
-            max_tokens=200,
-            temperature=0.0,
-        )
-        parsed = json.loads(raw)
-        # Validate columns exist
-        for key in ("x", "y", "color"):
-            if parsed.get(key) and parsed[key] not in df.columns:
-                parsed[key] = None
-        return parsed
-    except Exception as exc:
-        logger.warning("LLM chart decision failed: %s — using table_only", exc)
-        return {"chart_type": "table_only", "x": None, "y": None, "color": None}
-
 
 # ── chart rendering ───────────────────────────────────────────────────────────
 
@@ -232,22 +226,23 @@ def _build_chart(df: pd.DataFrame, decision: dict, question: str) -> go.Figure |
         df = df.sample(LARGE_RESULT_THRESHOLD, random_state=42)
         logger.info("Down-sampled dataframe to %d rows for chart.", LARGE_RESULT_THRESHOLD)
 
+    golden_sequence = ["#ca8a04", "#eab308", "#facc15", "#fde047", "#a16207"]
     try:
         if chart_type == "bar":
-            return px.bar(df, x=x, y=y, color=color, title=title)
+            return px.bar(df, x=x, y=y, color=color, title=title, color_discrete_sequence=golden_sequence)
         elif chart_type == "h_bar":
-            return px.bar(df, x=x, y=y, color=color, orientation="h", title=title)
+            return px.bar(df, x=x, y=y, color=color, orientation="h", title=title, color_discrete_sequence=golden_sequence)
         elif chart_type == "line":
-            return px.line(df, x=x, y=y, title=title)
+            return px.line(df, x=x, y=y, title=title, color_discrete_sequence=golden_sequence)
         elif chart_type == "multi_line":
-            return px.line(df, x=x, y=y, color=color, title=title)
+            return px.line(df, x=x, y=y, color=color, title=title, color_discrete_sequence=golden_sequence)
         elif chart_type == "scatter":
-            return px.scatter(df, x=x, y=y, color=color, title=title)
+            return px.scatter(df, x=x, y=y, color=color, title=title, color_discrete_sequence=golden_sequence)
         elif chart_type == "pie":
-            return px.pie(df, names=x, values=y, title=title)
+            return px.pie(df, names=x, values=y, title=title, color_discrete_sequence=golden_sequence)
         elif chart_type == "heatmap":
             num_df = df.select_dtypes(include="number")
-            return px.imshow(num_df, title=title)
+            return px.imshow(num_df, title=title, color_continuous_scale="YlOrBr")
         else:
             return None
     except Exception as exc:

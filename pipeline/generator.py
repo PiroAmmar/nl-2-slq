@@ -43,6 +43,21 @@ Output rules:
 - Use double-quoted identifiers only when the column name conflicts with SQL keywords.
 - Parameterised values only — no string concatenation.
 
+--- METRIC CATALOG & KPI RULES (CRITICAL) ---
+When calculating KPIs, you MUST use the canonical formulas defined below. NEVER invent formulas for these metrics.
+- Revenue -> SUM()
+- Sales -> SUM()
+- Gross Profit -> SUM()
+- Cost -> SUM()
+- Quantity -> SUM()
+- Average Price -> AVG()
+- Average Discount -> AVG()
+- Profit Margin -> SUM(Gross_Profit)/SUM(Net_Sales)*100
+- Return Rate -> SUM(Returns)/SUM(Sales)*100
+- Conversion Rate -> SUM(Conversions)/SUM(Visitors)*100
+
+BUSINESS RULE: NEVER calculate an overall ratio by averaging ratios (e.g., NEVER use AVG(Gross_Profit/Net_Sales) or AVG(Profit_Margin)). You MUST calculate the ratio of the sums (e.g., SUM(Gross_Profit)/SUM(Net_Sales)).
+
 String comparison rules (CRITICAL — prevents silent empty results):
 - ALWAYS wrap text column comparisons (including JOIN conditions) in LOWER(): LOWER(t1.col) = LOWER(t2.col)
 - NEVER use bare equality for string filters: Channel = 'retail' → LOWER(Channel) = 'retail'
@@ -63,7 +78,7 @@ NULL safety rules:
 """
 
 
-def generate_sql(
+async def generate_sql(
     question: str,
     selected_schema: dict[str, list[str]],
     budget: CallBudget,
@@ -71,6 +86,7 @@ def generate_sql(
     prior_sql: str | None = None,
     error_message: str | None = None,
     verifier_reasoning: str | None = None,
+    priority: str = "interactive",
 ) -> str:
     """
     Generate (or correct) a SQL query.
@@ -78,6 +94,8 @@ def generate_sql(
     When prior_sql + error_message are provided: correction mode (retry loop).
     When prior_sql + verifier_reasoning are provided: regeneration mode.
     Returns cleaned SQL string.
+
+    priority: passed through to call_llm ("interactive" or "background").
     """
     schema_text = _schema_to_text(selected_schema)
 
@@ -112,7 +130,7 @@ def generate_sql(
         )
         step = "generator-initial"
 
-    raw = call_llm(
+    raw = await call_llm(
         messages=[
             {"role": "system", "content": _SYSTEM},
             {"role": "user", "content": user_content},
@@ -121,6 +139,7 @@ def generate_sql(
         budget=budget,
         max_tokens=512,
         temperature=0.1,
+        priority=priority,
     )
 
     return _clean_sql(raw)
