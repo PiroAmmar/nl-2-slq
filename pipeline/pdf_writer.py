@@ -126,7 +126,9 @@ def write_qa_pdf(
                 question[:60],
             )
 
-    pdf.output(output_path)
+    tmp_path = f"{output_path}.tmp"
+    pdf.output(tmp_path)
+    os.replace(tmp_path, output_path)   # atomic on same filesystem: readers never see a partial file
     logger.info("PDF written to %s (%d Q&A blocks)", output_path, len(successes))
     return page_meta
 

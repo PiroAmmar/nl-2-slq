@@ -7,8 +7,9 @@ Usage:
 parse_questions(docx_path) -> list[dict]
     Returns: [{question, role, section}]
 
-await run_batch(questions, db_path, schema, dataset_hash, budget_per_q=15)
-    Returns: (successes, failures)
+await run_batch(questions, db_path, schema, dataset_hash,
+                offset=0, chunk_size=10, budget_per_q=15)
+    Returns: (successes, failures, next_offset, is_last_chunk)
     successes: [{question, sql, answer, role, section}]
     failures:  [{question, role, section, reason}]
 """
@@ -115,29 +116,33 @@ async def run_batch(
     schema: dict,
     dataset_hash: str,
     budget_per_q: int = 15,
+    offset: int = 0,
+    chunk_size: int = 10,
     cancel_event: asyncio.Event | None = None,
     priority: str = "background",
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], int, bool]:
     """
-    Run every question through the full pipeline (Steps 1-5), concurrently
-    (bounded by _MAX_CONCURRENT_QUESTIONS). Actual outbound-request pacing
-    against Groq is enforced centrally by pipeline.llm's RateLimiter, so
-    raising concurrency here does not risk more 429s — it just lets already
-    rate-limited requests overlap their non-network work (parsing, retries
-    waiting on backoff, sqlite I/O) instead of queueing behind one another.
+    Run a chunk of questions (questions[offset : offset+chunk_size]) through
+    the full pipeline, concurrently (bounded by _MAX_CONCURRENT_QUESTIONS).
 
-    If `cancel_event` is set (e.g. on server shutdown), in-flight questions
-    finish but no new ones start, and the loop returns early with whatever
-    completed so far collected as failures/successes.
+    Actual outbound-request pacing against Groq is enforced centrally by
+    pipeline.llm's RateLimiter; raising concurrency here does not risk more
+    429s.
 
-    Failed questions (never passed verification, budget exhausted, etc.) are
-    collected in `failures` — never silently dropped.
+    If `cancel_event` is set, in-flight questions finish but no new ones start.
 
     Returns:
+        (successes, failures, next_offset, is_last_chunk)
         successes: [{question, sql, answer, role, section}]
         failures:  [{question, role, section, reason}]
+        next_offset: offset to pass on the next call
+        is_last_chunk: True when this chunk reaches the end of questions
     """
-    total = len(questions)
+    chunk = questions[offset : offset + chunk_size]
+    next_offset = offset + len(chunk)
+    is_last_chunk = next_offset >= len(questions)
+
+    total = len(chunk)
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_QUESTIONS)
     results: list[dict | None] = [None] * total
 
@@ -145,6 +150,7 @@ async def run_batch(
         q = item["question"]
         role = item["role"]
         section = item["section"]
+        true_pos = idx + offset + 1  # 1-based position in the full question list
 
         if cancel_event is not None and cancel_event.is_set():
             results[idx] = {
@@ -163,7 +169,7 @@ async def run_batch(
                 }
                 return
 
-            logger.info("[batch %d/%d] Running: %s", idx + 1, total, q[:80])
+            logger.info("[batch %d/%d] Running: %s", true_pos, len(questions), q[:80])
             try:
                 result_entry = await _run_single(q, db_path, schema, dataset_hash, budget_per_q, priority=priority)
                 if result_entry is None:
@@ -188,14 +194,14 @@ async def run_batch(
                         "section": section,
                     }
             except Exception as exc:
-                logger.warning("[batch %d/%d] Failed: %s — %s", idx + 1, total, q[:60], exc)
+                logger.warning("[batch %d/%d] Failed: %s — %s", true_pos, len(questions), q[:60], exc)
                 results[idx] = {
                     "kind": "failure",
                     "question": q, "role": role, "section": section,
                     "reason": str(exc),
                 }
 
-    await asyncio.gather(*(_worker(i, item) for i, item in enumerate(questions)))
+    await asyncio.gather(*(_worker(i, item) for i, item in enumerate(chunk)))
 
     successes = [r for r in results if r and r["kind"] == "success"]
     failures = [r for r in results if r and r["kind"] == "failure"]
@@ -203,10 +209,10 @@ async def run_batch(
         r.pop("kind", None)
 
     logger.info(
-        "[batch] Done. %d succeeded, %d failed out of %d total.",
-        len(successes), len(failures), total,
+        "[batch] Chunk done. %d succeeded, %d failed (offset %d→%d, last=%s).",
+        len(successes), len(failures), offset, next_offset, is_last_chunk,
     )
-    return successes, failures
+    return successes, failures, next_offset, is_last_chunk
 
 
 # ── internals ─────────────────────────────────────────────────────────────────

@@ -70,10 +70,14 @@ class DocQAIngestResponse(BaseModel):
 
 class DocQAStatusResponse(BaseModel):
     job_id: str
-    status: str                            # "queued" | "running" | "done" | "failed" | "cancelled"
+    status: str                            # "queued"|"running"|"paused"|"done"|"failed"|"cancelled"
     total: Optional[int] = None
     success_count: Optional[int] = None
     failure_count: Optional[int] = None
+    # Chunked-progress fields (None until at least one chunk has finished)
+    current_batch: Optional[int] = None   # which chunk just finished (1-based)
+    batch_total: Optional[int] = None     # total number of chunks
+    total_processed: Optional[int] = None # questions processed so far across all chunks
     pdf_path: Optional[str] = None
     failures: Optional[list[dict]] = None
     error: Optional[str] = None
