@@ -1,8 +1,16 @@
-# NL-to-SQL Assistant
+<div align="center">
+  <img src="./logo.svg" alt="NL-to-SQL Assistant Logo" width="140" />
+  <h1>NL-to-SQL Assistant</h1>
+  <p><em>A production-grade Natural Language to SQL interface featuring an intelligent 5-stage RAG pipeline, dual-tier semantic caching, automated golden query generation, and chunked batch document ingestion with exact page-level PDF deep linking.</em></p>
 
-A production-grade, enterprise-ready Natural Language to SQL (NL-to-SQL) system featuring an intelligent 5-stage RAG pipeline, dual-tiered semantic caching with ChromaDB, automated golden query generation, and chunked batch document ingestion with exact page-level PDF deep linking.
-
-Built with a high-performance **FastAPI** backend and a refined, utilitarian **React 19 + Vite + TypeScript** frontend with dark/light themes and dynamic Plotly data visualizations.
+  <p>
+    <strong>FastAPI Backend</strong> &nbsp;•&nbsp;
+    <strong>React 19 + TypeScript + Vite</strong> &nbsp;•&nbsp;
+    <strong>ChromaDB Vector Store</strong> &nbsp;•&nbsp;
+    <strong>Groq LLM</strong> &nbsp;•&nbsp;
+    <strong>Gemini Embeddings</strong>
+  </p>
+</div>
 
 ---
 

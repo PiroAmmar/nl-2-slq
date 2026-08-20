@@ -23,3 +23,4 @@ chroma_store/
 # output_docs/
 improvements/
 .fallow/
+.agent/
